@@ -1,0 +1,52 @@
+{
+  "symbols": [
+    {"symbol": "BTCUSDT", "base": "BTC", "name": "Bitcoin", "aliases": ["Bitcoin", "BTC"]},
+    {"symbol": "ETHUSDT", "base": "ETH", "name": "Ethereum", "aliases": ["Ethereum", "Ether", "ETH"]},
+    {"symbol": "BNBUSDT", "base": "BNB", "name": "BNB", "aliases": ["BNB", "Binance Coin"]},
+    {"symbol": "XRPUSDT", "base": "XRP", "name": "XRP", "aliases": ["XRP", "Ripple"]},
+    {"symbol": "SOLUSDT", "base": "SOL", "name": "Solana", "aliases": ["Solana", "SOL"]},
+    {"symbol": "GRASSUSDT", "base": "GRASS", "name": "Grass", "aliases": ["Grass", "GRASS"]}
+  ],
+  "intervals": ["1m", "5m"],
+  "default_interval": "5m",
+  "opening_range_minutes": 15,
+  "refresh_seconds": 10,
+  "news_refresh_seconds": 900,
+  "history_days": 60,
+  "default_replays": 10000,
+  "simulation_seed": 19,
+  "simulation_horizon_hours": 12,
+  "simulation_block_minutes": 60,
+  "risk": {
+    "account_usd": 5000,
+    "risk_per_trade_usd": 50,
+    "daily_loss_limit_usd": 150,
+    "max_trades_per_day": 3,
+    "max_position_usd": 4000,
+    "min_notional_usd": 5,
+    "fee_rate": 0.001,
+    "slippage_rate": 0.0005
+  },
+  "binance": {
+    "spot_base_url": "https://api.binance.com",
+    "futures_base_url": "https://fapi.binance.com",
+    "timeout_seconds": 10,
+    "retries": 2,
+    "page_limit": 1000,
+    "fallback_to_futures": true
+  },
+  "news": {
+    "feeds": [
+      {"name": "CoinTelegraph", "url": "https://cointelegraph.com/rss"},
+      {"name": "CoinDesk", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
+      {"name": "Decrypt", "url": "https://decrypt.co/feed"}
+    ],
+    "fear_greed_url": "https://api.alternative.me/fng/?limit=1"
+  },
+  "storage": {
+    "paper_trades": "data/paper_trades.json",
+    "alert_rules": "alerts.json",
+    "alert_state": "data/alert_state.json",
+    "news_state": "data/news_state.json"
+  }
+}
