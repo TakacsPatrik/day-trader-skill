@@ -25,7 +25,7 @@ class Repository(unittest.TestCase):
     def test_dashboard_dependencies_are_declared(self):
         with open(os.path.join(ROOT, "requirements.txt"), encoding="utf-8") as handle:
             requirements = handle.read()
-        for package in ("streamlit", "plotly", "requests"):
+        for package in ("streamlit", "plotly", "requests", "scikit-learn"):
             self.assertIn(package, requirements)
 
     def test_readme_documents_local_only_paper_mode(self):

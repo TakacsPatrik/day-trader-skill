@@ -1,4 +1,4 @@
-"""Crypto terminal: live scanner, chart, Time Machine, paper journal, alerts."""
+"""Crypto terminal: live SMC scanner, chart, ML setup classifier, paper journal, alerts."""
 
 import concurrent.futures
 import datetime
@@ -11,11 +11,12 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from binance_client import INTERVAL_MS, BinanceClient, ROOT, load_config
+import ml_model
 import technical_analysis as ta
-from crypto_engine import (TradingError, analyze_setup, build_plan, dec, evaluate_breakout,
-                           simulate_trade, size_position, validate_risk)
-from paper_trading import (close_trade, daily_risk, list_trades, record_entry,
-                           unrealized_pnl)
+from crypto_engine import (TradingError, analyze_setup, build_plan, dec,
+                           size_position, validate_risk)
+from paper_trading import (auto_close_trades, close_trade, daily_risk, list_trades,
+                           record_entry, unrealized_pnl)
 
 CACHE_TTL_SECONDS = 5
 REFRESH_CHOICES = (5, 10, 30)
@@ -24,14 +25,13 @@ UP, DOWN, ACCENT = "#26a69a", "#ef5350", "#2962ff"
 BG, GRID, MUTED = "#131722", "#2a2e39", "#787b86"
 UTC = datetime.timezone.utc
 
-SIGNAL_LABELS = {"triggered": ("🟢", "BREAKOUT"), "waiting": ("👀", "WATCHING"),
-                 "forming": ("⏳", "FORMING"), "no_data": ("⚠️", "NO DATA"),
-                 "error": ("⚠️", "ERROR")}
 ALERT_LABELS = {"above": "Ár fölé emelkedik", "below": "Ár alá esik",
                 "target": "Target elérése", "stop": "Stop elérése"}
-LAYER_CHOICES = ["EMA 20", "EMA 50", "EMA 200", "VWAP", "Bollinger", "Támasz / Ellenállás"]
-DEFAULT_LAYERS = ["EMA 20", "EMA 50", "Bollinger", "Támasz / Ellenállás"]
+LAYER_CHOICES = ["EMA 20", "EMA 50", "EMA 200", "VWAP", "Bollinger", "Támasz / Ellenállás", "SMC & Alakzatok"]
+DEFAULT_LAYERS = ["EMA 20", "EMA 50", "Bollinger", "Támasz / Ellenállás", "SMC & Alakzatok"]
 STATUS_ICONS = {"ok": "✅", "warn": "⚠️", "bad": "❌"}
+TREND_LABELS = {"uptrend": "📈 Emelkedő (HH+HL)", "downtrend": "📉 Csökkenő (LH+LL)",
+                "range": "↔️ Oldalazó"}
 
 CSS = """
 <style>
@@ -45,9 +45,9 @@ header[data-testid="stHeader"] {background: transparent;}
 [data-testid="stMetricValue"] * {overflow: visible !important; text-overflow: clip !important;}
 .sig {display: inline-block; padding: 1px 9px; border-radius: 10px; font-size: .72rem;
       font-weight: 700; letter-spacing: .05em; background: #2a2e39; color: #d1d4dc;}
-.sig-triggered, .sig-strong_buy {background: rgba(38,166,154,.22); color: #26a69a;}
-.sig-waiting, .sig-buy_watch {background: rgba(41,98,255,.20); color: #5c8dff;}
-.sig-forming, .sig-no_data, .sig-error, .sig-neutral {background: rgba(255,179,0,.18); color: #ffb300;}
+.sig-strong_buy {background: rgba(38,166,154,.22); color: #26a69a;}
+.sig-buy_watch {background: rgba(41,98,255,.20); color: #5c8dff;}
+.sig-no_data, .sig-error, .sig-neutral {background: rgba(255,179,0,.18); color: #ffb300;}
 .sig-avoid {background: rgba(239,83,80,.20); color: #ef5350;}
 .src {color: #787b86; font-size: .7rem; margin-left: 6px;}
 .mini {color: #9598a1; font-size: .72rem; white-space: nowrap; overflow: hidden;
@@ -114,10 +114,22 @@ def _load_all(interval):
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(symbols))) as pool:
         outcomes = list(pool.map(
             lambda symbol: _fetch_symbol(client, symbol, interval, kwargs, cost_rate, now), symbols))
+    results = {s: r for s, (r, _, _) in zip(symbols, outcomes) if r is not None}
+    quotes = {s: {"price": r["bars"][-1]["close"],
+                  "high": r["bars"][-1]["high"],
+                  "low": r["bars"][-1]["low"]}
+              for s, r in results.items() if r.get("bars")}
+    try:
+        auto_closed = auto_close_trades(quotes, fee_rate=risk.get("fee_rate", 0),
+                                        slippage_rate=risk.get("slippage_rate", 0),
+                                        config=config, now=now)
+    except Exception:
+        auto_closed = []
     return {"interval": interval, "fetched_at": now,
-            "results": {s: r for s, (r, _, _) in zip(symbols, outcomes) if r is not None},
+            "results": results,
             "advice": {s: a for s, (_, a, _) in zip(symbols, outcomes) if a is not None},
-            "errors": {s: e for s, (_, _, e) in zip(symbols, outcomes) if e}}
+            "errors": {s: e for s, (_, _, e) in zip(symbols, outcomes) if e},
+            "auto_closed": auto_closed}
 
 
 def _last_24h(bars):
@@ -158,6 +170,15 @@ def _clock(moment):
 
 def _snapshot(config, interval):
     data = _load_all(interval)
+    for closed_trade in data.get("auto_closed", []):
+        seen = st.session_state.setdefault("notified_auto_closed", set())
+        if closed_trade["id"] not in seen:
+            seen.add(closed_trade["id"])
+            reason_lbl = "🎯 TARGET" if closed_trade.get("exit_reason") == "target" else "🛑 STOP-LOSS"
+            st.toast("%s elérve (%s): %s lezárva @ %s (P&L: %s)" %
+                     (reason_lbl, closed_trade["symbol"], closed_trade["id"][:8],
+                      _fmt_price(closed_trade["exit_price"]),
+                      _usd(closed_trade["realized_pnl_usd"], signed=True)))
     now = datetime.datetime.now(UTC)
     now_ms = int(now.timestamp() * 1000)
     rows = []
@@ -166,15 +187,9 @@ def _snapshot(config, interval):
         result = data["results"].get(symbol)
         row = {"symbol": symbol, "base": coin.get("base", symbol[:-4]), "result": result,
                "error": data["errors"].get(symbol), "price": None, "change": None,
-               "signal": {"status": "no_data", "reason": data["errors"].get(symbol, "No data")},
                "stale": False}
         if result and result["bars"]:
             bars = result["bars"]
-            try:
-                row["signal"] = evaluate_breakout(bars, symbol, interval, now,
-                                                  config["opening_range_minutes"])
-            except Exception as exc:
-                row["signal"] = {"status": "error", "reason": str(exc)}
             row["price"] = bars[-1]["close"]
             day_bars = _last_24h(bars)
             if day_bars[0]["open"]:
@@ -207,8 +222,6 @@ def _render_ticker(config, interval, refresh, auto):
         for offset in range(0, len(rows), per_row):
             columns = st.columns(per_row)
             for column, row in zip(columns, rows[offset:offset + per_row]):
-                status = row["signal"]["status"]
-                icon, label = SIGNAL_LABELS.get(status, ("⚠️", status.upper()))
                 with column.container(border=True):
                     if row["price"] is None:
                         st.metric(row["base"], "—")
@@ -219,16 +232,18 @@ def _render_ticker(config, interval, refresh, auto):
                     stale = " · ELAVULT" if row["stale"] else ""
                     advice = row["advice"]
                     if advice:
+                        trend_txt = TREND_LABELS.get(advice["structure"]["trend"], "—")
                         st.markdown(
-                            '<span class="sig sig-%s">%s · %d</span>'
+                            '<span class="sig sig-%s">%s · %d</span><span class="src">%s%s</span>'
                             '<div class="mini" title="%s">🕯 %s</div>'
-                            '<div class="mini">🎯 T1 <b>%+.2f%%</b> · SL <b>%+.2f%%</b></div>' %
+                            '<div class="mini">%s · 🎯 T1 <b>%+.2f%%</b> · SL <b>%+.2f%%</b></div>' %
                             (advice["rating"].lower(), advice["short_label"], advice["score"],
-                             advice["pattern_summary"], advice["pattern_summary"],
-                             advice["t1_pct"] or 0, advice["stop_pct"] or 0),
+                             market, stale, advice["pattern_summary"], advice["pattern_summary"],
+                             trend_txt, advice["t1_pct"] or 0, advice["stop_pct"] or 0),
                             unsafe_allow_html=True)
-                    st.markdown('<span class="sig sig-%s">%s %s%s</span><span class="src">%s</span>' %
-                                (status, icon, label, stale, market), unsafe_allow_html=True)
+                    else:
+                        st.markdown('<span class="sig sig-no_data">⚪ N/A%s</span><span class="src">%s</span>' %
+                                    (stale, market), unsafe_allow_html=True)
         _status_bar(data, now, refresh, auto)
         for symbol, message in data["errors"].items():
             st.warning("%s: %s" % (symbol, message))
@@ -236,8 +251,8 @@ def _render_ticker(config, interval, refresh, auto):
     ticker()
 
 
-def _active_plan(selected, signal, advice=None, actionable_only=False):
-    """Plan levels in priority order: loaded/calculator plan, advisor, UTC breakout."""
+def _active_plan(selected, advice=None, actionable_only=False):
+    """Plan levels in priority order: loaded/calculator plan, advisor (SMC + swing levels)."""
     saved = st.session_state.get("last_plan")
     if saved and saved.get("symbol") == selected:
         return {"entry": dec(saved["entry"]), "stop": dec(saved["stop"]), "target": dec(saved["target"]),
@@ -246,15 +261,10 @@ def _active_plan(selected, signal, advice=None, actionable_only=False):
     if advice and advice.get("entry") is not None and (advice["actionable"] or not actionable_only):
         return {"entry": advice["entry"], "stop": advice["stop"], "target": advice["t1"],
                 "t2": advice["t2"], "source": "Okos Tanácsadó (T1 / T2)"}
-    sig, opening = signal.get("signal"), signal.get("opening_range")
-    if sig and opening and opening["low"] < sig["entry"]:
-        entry, stop = sig["entry"], opening["low"]
-        return {"entry": entry, "stop": stop, "target": entry + (entry - stop) * DEFAULT_TARGET_R,
-                "t2": None, "source": "UTC breakout (OR low stop, %sR)" % DEFAULT_TARGET_R}
     return None
 
 
-def _candlestick(symbol, result, signal, plan, candles, layers=(), advice=None):
+def _candlestick(symbol, result, plan, candles, layers=(), advice=None):
     bars = result["bars"][-candles:]
     step = INTERVAL_MS[result["interval"]]
     xs = [datetime.datetime.fromtimestamp(bar["open_time"] / 1000, UTC) for bar in bars]
@@ -294,18 +304,6 @@ def _candlestick(symbol, result, signal, plan, candles, layers=(), advice=None):
         line("bb_mid", "BB közép", "rgba(92,141,255,0.5)", "dot", 1)
 
     prices = [float(b["high"]) for b in bars] + [float(b["low"]) for b in bars]
-    opening = signal.get("opening_range")
-    if opening:
-        fig.add_shape(type="rect", row=1, col=1, layer="below", line_width=0,
-                      x0=datetime.datetime.fromtimestamp(opening["start_utc_ms"] / 1000, UTC),
-                      x1=xs[-1] + datetime.timedelta(milliseconds=step),
-                      y0=float(opening["low"]), y1=float(opening["high"]),
-                      fillcolor="rgba(41,98,255,0.10)")
-        for label, price in (("OR High", opening["high"]), ("OR Low", opening["low"])):
-            fig.add_hline(y=float(price), row=1, col=1, line_dash="dot", line_color="#5c8dff",
-                          annotation_text="%s %s" % (label, _fmt_price(price)),
-                          annotation_position="right", annotation_font_color="#5c8dff")
-            prices.append(float(price))
     if plan:
         levels = [("Entry", plan["entry"], "#ffb300"), ("Stop-Loss", plan["stop"], DOWN),
                   ("Target", plan["target"], "#00e676")]
@@ -333,6 +331,22 @@ def _candlestick(symbol, result, signal, plan, candles, layers=(), advice=None):
                                                               zone["touches"]),
                               annotation_position="top left", annotation_font_size=10,
                               annotation_font_color="#9598a1")
+    if advice and "SMC & Alakzatok" in layers and advice.get("smc"):
+        for sweep in advice["smc"].get("sweeps", []):
+            is_bull = sweep["type"] == "bullish"
+            color = "#00e676" if is_bull else "#ff5252"
+            fig.add_hline(y=float(sweep["level"]), row=1, col=1, line_dash="dot", line_width=1.2,
+                          line_color=color,
+                          annotation_text="SMC Sweep %s" % _fmt_price(sweep["level"]),
+                          annotation_position="bottom left" if is_bull else "top left",
+                          annotation_font_color=color, annotation_font_size=10)
+        for geo in advice["smc"].get("geometry", []):
+            if geo.get("level") is not None and low_view <= float(geo["level"]) <= high_view:
+                fig.add_hline(y=float(geo["level"]), row=1, col=1, line_dash="dashdot", line_width=1.1,
+                              line_color="#5c8dff",
+                              annotation_text="%s (%s)" % (geo["name"], _fmt_price(geo["level"])),
+                              annotation_position="top left", annotation_font_color="#5c8dff",
+                              annotation_font_size=10)
     fig.update_layout(
         template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=640,
         margin=dict(l=10, r=130, t=45, b=10), hovermode="x unified", dragmode="pan",
@@ -348,10 +362,14 @@ def _candlestick(symbol, result, signal, plan, candles, layers=(), advice=None):
 def _scanner_table(rows):
     table = []
     for row in rows:
-        icon, label = SIGNAL_LABELS.get(row["signal"]["status"], ("⚠️", "?"))
-        opening = row["signal"].get("opening_range")
         change = row["change"]
         advice = row["advice"]
+        smc_summary = "—"
+        if advice and advice.get("smc"):
+            sweeps = advice["smc"].get("sweeps", [])
+            if sweeps:
+                s = sweeps[0]
+                smc_summary = ("🟢 Bikás Sweep" if s["type"] == "bullish" else "🔴 Medvés Sweep")
         table.append({
             "Coin": row["symbol"],
             "Ár (USDT)": _fmt_price(row["price"]) if row["price"] is not None else "—",
@@ -359,12 +377,11 @@ def _scanner_table(rows):
                     if change is not None else "—"),
             "Setup Score": advice["score"] if advice else None,
             "Tanács": advice["short_label"] if advice else "—",
+            "Piaci struktúra": TREND_LABELS.get(advice["structure"]["trend"], "—") if advice else "—",
+            "SMC / Likviditás": smc_summary,
             "Mintázat": advice["pattern_summary"] if advice else "—",
             "T1 hozam": "%+.2f%%" % advice["t1_pct"] if advice and advice["t1_pct"] is not None else "—",
             "Stop": "%+.2f%%" % advice["stop_pct"] if advice and advice["stop_pct"] is not None else "—",
-            "UTC breakout": "%s %s%s" % (icon, label, " (elavult)" if row["stale"] else ""),
-            "OR High": _fmt_price(opening["high"]) if opening else "—",
-            "OR Low": _fmt_price(opening["low"]) if opening else "—",
             "Utolsó gyertya (UTC)": (row["result"]["bars"][-1]["open_time_utc"][11:19]
                                      if row["result"] and row["result"]["bars"] else "—"),
             "Forrás": row["result"]["market"].upper() if row["result"] else "—"})
@@ -372,7 +389,7 @@ def _scanner_table(rows):
 
 
 def _load_advisor_plan(config, selected, advice, filters):
-    """Copy the advisor's levels into the calculator and the plan used by Time Machine."""
+    """Copy the advisor's levels into the calculator and active plan."""
     cfg_risk = config.get("risk", {})
     plan = build_plan(advice["entry"], advice["stop"], DEFAULT_TARGET_R, filters, target=advice["t1"])
     size = size_position(plan["entry"], plan["stop"], cfg_risk.get("risk_per_trade_usd", 50), filters,
@@ -388,7 +405,7 @@ def _load_advisor_plan(config, selected, advice, filters):
 
 
 def _render_advisor(config, selected, advice, filters):
-    st.subheader("🧠 Okos Tanácsadó & Mintázatok")
+    st.subheader("🧠 Okos Tanácsadó, Geometriai Alakzatok & SMC")
     if not advice or advice.get("status") != "ok":
         text = advice["advice"] if advice and advice.get("advice") else "Az elemzés nem elérhető."
         st.info(text)
@@ -418,8 +435,9 @@ def _render_advisor(config, selected, advice, filters):
                        delta_color="off")
         mode = "limit (visszateszt)" if advice["entry_mode"] == "pullback" else "piaci ár"
         cols[4].metric("Optimum Entry", _fmt_price(advice["entry"]), mode, delta_color="off")
-        st.caption("Stop: %s. A „biztonságos” hozam konzervatív becslés (ATR + swing szintek), nem garancia; "
-                   "a Time Machine fülön ellenőrizheted a történelmi találati arányát." % advice["stop_basis"])
+        st.caption("Stop: %s. A „biztonságos” hozam konzervatív becslés (ATR + swing/SMC szintek), nem garancia; "
+                   "az ML Valószínűség fülön ellenőrizheted a setup gépi tanulási nyerési esélyét." %
+                   advice["stop_basis"])
     else:
         st.warning("A szintek nem számíthatók a coin tick méretével.")
     left, right = st.columns(2)
@@ -427,10 +445,10 @@ def _render_advisor(config, selected, advice, filters):
         st.markdown("**Indoklás**")
         st.markdown("\n".join("- %s %s" % (STATUS_ICONS[r["status"]], r["text"]) for r in advice["reasons"]))
     with right:
-        st.markdown("**Felismert mintázatok**")
+        st.markdown("**Felismert geometriai, SMC és gyertyamintázatok**")
         patterns = advice["patterns"]
         if not patterns:
-            st.caption("Nincs felismert gyertya- vagy chart-mintázat.")
+            st.caption("Nincs felismert gyertya-, chart- vagy likviditás-mintázat.")
         for pattern in patterns:
             icon = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}[pattern["type"]]
             age = "" if pattern["group"] == "chart" else (" (utolsó gyertya)" if pattern["age"] == 0
@@ -450,13 +468,13 @@ def _render_advisor(config, selected, advice, filters):
         st.dataframe([{"Csoport": p["group"], "Szempont": p["name"],
                        "Pont": "%d / %d" % (p["earned"], p["max"]), "Megjegyzés": p["text"]}
                       for p in advice["breakdown"]], hide_index=True)
-    if advice["entry"] is not None and st.button("⚡ Javasolt terv betöltése a Kalkulátorba és a Time Machine-be",
+    if advice["entry"] is not None and st.button("⚡ Javasolt terv betöltése a Kalkulátorba",
                                                  type="primary", key="load-advisor-plan"):
         try:
             _load_advisor_plan(config, selected, advice, filters)
             st.session_state["plan_notice"] = (
                 "⚡ A Tanácsadó terve betöltve (Entry %s, Stop %s, T1 %s, T2 %s). "
-                "Nézd meg a Time Machine és a Paper Trading fület." %
+                "Nézd meg az ML Valószínűség és a Paper Trading fület." %
                 (_fmt_price(advice["entry"]), _fmt_price(advice["stop"]),
                  _fmt_price(advice["t1"]), _fmt_price(advice["t2"])))
             st.rerun()
@@ -469,27 +487,24 @@ def _render_live_tab(config, interval, selected, candles, layers, refresh, auto)
     def live():
         rows, data, now = _snapshot(config, interval)
         row = next(item for item in rows if item["symbol"] == selected)
-        result, signal, advice = row["result"], row["signal"], row["advice"]
+        result, advice = row["result"], row["advice"]
         if not result or not result["bars"]:
             st.error("Nincs elérhető gyertyaadat a(z) %s párhoz: %s" %
                      (selected, row["error"] or "üres válasz"))
         else:
-            plan = _active_plan(selected, signal, advice, actionable_only=True)
+            plan = _active_plan(selected, advice, actionable_only=True)
             columns = st.columns(4)
             columns[0].metric("Ár (USDT)", _fmt_price(row["price"]),
                               "%+.2f%% (24h)" % float(row["change"]) if row["change"] is not None else None)
             columns[1].metric("Tanács", advice["short_label"] if advice else "—",
                               "Score %d" % advice["score"] if advice else None, delta_color="off")
-            opening = signal.get("opening_range")
-            columns[2].metric("UTC nyitó sáv",
-                              "%s – %s" % (_fmt_price(opening["low"]), _fmt_price(opening["high"]))
-                              if opening else "—")
+            columns[2].metric("Piaci struktúra (SMC)",
+                              TREND_LABELS.get(advice["structure"]["trend"], "—") if advice else "—")
             columns[3].metric("Adatforrás", result["market"].upper())
-            st.plotly_chart(_candlestick(selected, result, signal, plan, candles, layers, advice),
+            st.plotly_chart(_candlestick(selected, result, plan, candles, layers, advice),
                             key="live-chart", config={"displaylogo": False, "scrollZoom": True})
-            st.caption("Entry/Stop/Target: %s. Az élő (képződő) gyertya nem erősít meg kitörést. %s" %
-                       (plan["source"] if plan else "nincs javasolt belépő – lásd a Tanácsadót",
-                        signal.get("reason", "")))
+            st.caption("Entry/Stop/Target: %s. Az indikátorok és alakzatok lezárt gyertyákból számolódnak." %
+                       (plan["source"] if plan else "nincs javasolt belépő – lásd a Tanácsadót"))
             st.divider()
             _render_advisor(config, selected, advice, result["filters"])
         st.divider()
@@ -501,159 +516,150 @@ def _render_live_tab(config, interval, selected, candles, layers, refresh, auto)
     live()
 
 
-def _histogram(output, plan):
-    returns = output["terminal_returns_pct"]
-    low, high = min(returns), max(returns)
-    size = (high - low) / 60 or 1.0
-    bins = dict(start=low, end=high + size, size=size)
-    fig = go.Figure()
-    fig.add_trace(go.Histogram(x=[v for v in returns if v < 0], xbins=bins, name="Veszteség",
-                               marker_color=DOWN))
-    fig.add_trace(go.Histogram(x=[v for v in returns if v >= 0], xbins=bins, name="Nyereség",
-                               marker_color=UP))
-    entry, stop, target = plan
-    for label, price, color in (("Stop", stop, DOWN), ("Target", target, "#00e676")):
-        fig.add_vline(x=float((price / entry - 1) * 100), line_dash="dash", line_color=color,
-                      annotation_text="%s %+.2f%%" % (label, float((price / entry - 1) * 100)))
-    fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, barmode="overlay",
-                      title="Szimulált záró hozam eloszlása (%)", xaxis_title="Hozam (%)",
-                      yaxis_title="Futások", height=420, margin=dict(t=50, b=10),
-                      legend=dict(orientation="h", y=1.1))
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_trained_ml(symbol, interval, days):
+    config = load_config()
+    client = _client()
+    now = datetime.datetime.now(UTC)
+    step = INTERVAL_MS[interval]
+    bars_per_day = 86_400_000 // step
+    days = min(int(days), max(3, 20_000 // bars_per_day))
+    start = int((now - datetime.timedelta(days=days)).timestamp() * 1000)
+    history = client.get_klines(symbol, interval, limit=days * bars_per_day,
+                                start_time=start, end_time=int(now.timestamp() * 1000))
+    bundle = ml_model.train_model(history["bars"], interval, now=now, config=config)
+    bundle["symbol"] = symbol
+    bundle["market"] = history["market"]
+    bundle["days"] = days
+    return bundle
+
+
+def _importance_chart(factors):
+    top = list(reversed(factors[:10]))
+    fig = go.Figure(go.Bar(
+        x=[f["importance"] * 100 for f in top],
+        y=[f["label"] for f in top],
+        orientation="h",
+        marker_color=[UP if f["effect"] >= 0 else DOWN for f in top],
+        text=["%.1f%% (%+.1f pp)" % (f["importance"] * 100, f["effect"] * 100) for f in top],
+        textposition="auto"))
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
+        title="Legfontosabb döntési faktorok (Feature Importance & lokális hatás)",
+        xaxis_title="Fontosság (%)", height=380, margin=dict(l=10, r=20, t=45, b=10))
     fig.update_xaxes(gridcolor=GRID)
     fig.update_yaxes(gridcolor=GRID)
     return fig
 
 
-def _path_fan(output, plan):
+def _calibration_chart(calibration, base_rate):
     fig = go.Figure()
-    for path in output["sample_paths"]:
-        fig.add_trace(go.Scatter(y=path, mode="lines", line=dict(width=1, color="rgba(92,141,255,0.35)"),
-                                 showlegend=False, hoverinfo="skip"))
-    for label, price, color in (("Entry", plan[0], "#ffb300"), ("Stop", plan[1], DOWN),
-                                ("Target", plan[2], "#00e676")):
-        fig.add_hline(y=float(price), line_dash="dash", line_color=color, annotation_text=label)
-    fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
-                      title="Minta árfolyamutak (%d)" % len(output["sample_paths"]),
-                      xaxis_title="Gyertya", yaxis_title="Ár", height=420, margin=dict(t=50, b=10))
-    fig.update_xaxes(gridcolor=GRID)
-    fig.update_yaxes(gridcolor=GRID)
+    if calibration:
+        fig.add_trace(go.Scatter(
+            x=[b["mean_pred"] * 100 for b in calibration],
+            y=[b["actual"] * 100 for b in calibration],
+            mode="lines+markers+text",
+            text=["n=%d" % b["count"] for b in calibration],
+            textposition="top center",
+            marker=dict(size=9, color=ACCENT),
+            line=dict(color=ACCENT, width=2),
+            name="Valós találati arány"))
+    fig.add_trace(go.Scatter(
+        x=[0, 100], y=[0, 100], mode="lines",
+        line=dict(color=MUTED, dash="dash"), name="Tökéletes kalibráció"))
+    fig.add_hline(y=base_rate * 100, line_dash="dot", line_color="#ffb300",
+                  annotation_text="Alapráta %.1f%%" % (base_rate * 100))
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
+        title="Out-of-Sample Kalibráció (Holdout teszt)",
+        xaxis_title="Modell által becsült valószínűség (%)",
+        yaxis_title="Tényleges győzelmi arány (%)",
+        height=380, margin=dict(l=10, r=20, t=45, b=10),
+        legend=dict(orientation="h", y=1.1))
+    fig.update_xaxes(gridcolor=GRID, range=[0, 100])
+    fig.update_yaxes(gridcolor=GRID, range=[0, 100])
     return fig
 
 
-def _odds_bar(probs):
-    fig = go.Figure()
-    for key, label, color in (("target", "Target előbb", "#00e676"), ("stop", "Stop előbb", DOWN),
-                              ("neither", "Egyik sem", MUTED)):
-        fig.add_trace(go.Bar(y=[""], x=[probs[key] * 100], orientation="h", name=label,
-                             marker_color=color, text="%.1f%%" % (probs[key] * 100),
-                             textposition="inside"))
-    fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, barmode="stack",
-                      height=130, margin=dict(l=0, r=0, t=10, b=0), xaxis=dict(range=[0, 100]),
-                      legend=dict(orientation="h", y=-0.4))
-    return fig
+def _render_ml_tab(config, interval, selected, result):
+    st.subheader("🤖 ML Valószínűségi Osztályozó (RandomForestClassifier)")
+    cfg_ml = ml_model.settings(config)
+    st.caption(
+        "Helyben tanuló gépi tanulási modell (`scikit-learn RandomForestClassifier`), amely a múltbeli "
+        "gyertyák geometriai alakzataiból, SMC likviditás-lesöpréseiből, relatív forgalmából (RVOL), "
+        "ATR volatilitásából és a mozgóátlagoktól való távolságból becsüli meg annak valószínűségét, "
+        "hogy az aktuális setup eléri az **%.1f×ATR célárat** az **%.1f×ATR stop** előtt (%d gyertyán belül)." %
+        (cfg_ml["target_atr"], cfg_ml["stop_atr"], cfg_ml["horizon_bars"]))
 
-
-def _render_time_machine(config, interval, selected, signal, advice):
-    st.caption("Volatilitás-igazított block bootstrap: történelmi gyertyablokkok, az aktuális ATR-hez "
-               "skálázva. A valószínűségek szimulációs kimenetek, nem előrejelzések.")
-    plan = _active_plan(selected, signal, advice)
-    levels = None
-    if plan:
-        targets = {"T1 (biztonságos cél)": plan["target"]}
-        if plan.get("t2"):
-            targets["T2 (kiterjesztett cél)"] = plan["t2"]
-        choice = st.radio("Szimulált célár", list(targets), horizontal=True,
-                          key="sim_target_choice") if len(targets) > 1 else next(iter(targets))
-        levels = (plan["entry"], plan["stop"], targets[choice])
-    source = plan["source"] if plan else None
-    with st.expander("Saját szintek megadása (opcionális, felülírja az aktív tervet)"):
-        cols = st.columns(3)
-        custom = [cols[0].text_input("Entry", key="sim_entry_" + selected),
-                  cols[1].text_input("Stop", key="sim_stop_" + selected),
-                  cols[2].text_input("Target", key="sim_target_" + selected)]
-    with st.expander("Haladó beállítások"):
-        cols = st.columns(2)
-        horizon_hours = cols[0].number_input(
-            "Tartási idő (óra)", 1, 72, int(config.get("simulation_horizon_hours", 12)))
-        block_minutes = cols[1].number_input(
-            "Blokkhossz (perc)", 5, 360, int(config.get("simulation_block_minutes", 60)), step=5)
-    if any(item.strip() for item in custom):
-        try:
-            levels = tuple(dec(item, name) for item, name in zip(custom, ("entry", "stop", "target")))
-            if not levels[1] < levels[0] < levels[2]:
-                raise TradingError("A szintekre Stop < Entry < Target kell teljesüljön")
-            source = "saját szintek"
-        except TradingError as exc:
-            st.error(str(exc))
-            levels = None
-    if levels is None:
-        st.info("Nincs aktív terv. Töltsd be a Tanácsadó javaslatát az 1. fülön, számolj tervet a 3. fülön, "
-                "vagy adj meg saját szinteket.")
-    else:
-        cols = st.columns(5)
-        cols[0].metric("Entry", _fmt_price(levels[0]))
-        cols[1].metric("Stop-Loss", "%s (%+.2f%%)" % (_fmt_price(levels[1]), float((levels[1] / levels[0] - 1) * 100)))
-        cols[2].metric("Target", "%s (%+.2f%%)" % (_fmt_price(levels[2]), float((levels[2] / levels[0] - 1) * 100)))
-        cols[3].metric("Forrás", source.split(" (")[0])
-        cols[4].metric("Aktuális ATR", "%.3f%%" % advice["indicators"]["atr_pct"] if advice else "auto")
-    runs = int(config.get("default_replays", 10_000))
-    if st.button("▶ %s szimuláció futtatása" % "{:,}".format(runs).replace(",", " "),
-                 type="primary", disabled=levels is None):
-        try:
-            now = datetime.datetime.now(UTC)
-            step = INTERVAL_MS[interval]
-            bars_per_day = 86_400_000 // step
-            days = min(int(config.get("history_days", 60)), max(3, 20_000 // bars_per_day))
-            start = int((now - datetime.timedelta(days=days)).timestamp() * 1000)
-            with st.spinner("Történelmi adatok letöltése és szimuláció..."):
-                history = _client().get_klines(selected, interval, limit=days * bars_per_day,
-                                               start_time=start, end_time=int(now.timestamp() * 1000))
-                output = simulate_trade(
-                    history["bars"], levels[0], levels[1], levels[2], interval, runs,
-                    int(config.get("simulation_seed", 19)), now,
-                    max_steps=int(horizon_hours * 3_600_000 // step),
-                    current_atr=advice["indicators"]["atr"] if advice else None,
-                    block_size=max(1, int(block_minutes * 60_000 // step)))
-            st.session_state["simulation"] = {"output": output, "plan": levels, "symbol": selected,
-                                              "interval": interval, "market": history["market"],
-                                              "days": days}
-        except Exception as exc:
-            st.error("A szimuláció nem sikerült: %s" % exc)
-    saved = st.session_state.get("simulation")
-    if not saved or saved["symbol"] != selected:
+    if not result or not result.get("bars"):
+        st.warning("Nincs elérhető piaci adat a(z) %s párhoz." % selected)
         return
-    output, sim_plan = saved["output"], saved["plan"]
-    for warning in output.get("warnings", []):
+
+    default_days = int(config.get("history_days", 30))
+    col_btn, col_days = st.columns([3, 1])
+    days = col_days.number_input("Tanító időszak (nap)", min_value=5, max_value=60, value=default_days, step=5,
+                                 key="ml_days_" + selected)
+    retrain = col_btn.button("🔄 Modell újratanítása a legfrissebb történelmi adatokon", type="secondary")
+    if retrain:
+        _load_trained_ml.clear()
+
+    try:
+        with st.spinner("Helyi RandomForest modell tanítása és kiértékelése (%s · %s)..." % (selected, interval)):
+            bundle = _load_trained_ml(selected, interval, days)
+            prediction = ml_model.predict_setup(bundle, result["bars"])
+    except Exception as exc:
+        st.error("Az ML modell nem futtatható: %s" % exc)
+        return
+
+    for warning in bundle.get("warnings", []):
         st.warning(warning)
-    hist = output["historical"]
-    if hist["similar"]:
-        st.markdown(
-            '<div class="hero"><div class="lbl">Történelmi találati arány (hasonló volatilitású időszakok)</div>'
-            '<div class="val">%.1f%%</div><div class="sub">Az elmúlt %d nap %d hasonló volatilitású '
-            '(ATR %.2f%%–%.2f%%) időszakából <b>%d alkalommal érte el a célárat a stop előtt</b>, '
-            '%d alkalommal a stop jött előbb, %d alkalommal egyik sem.<br>'
-            'A %d gyertyás lépésközű ablakok átfedik egymást, ezért a tényleges független minta kisebb.</div></div>' %
-            (hist["target_rate"] * 100, saved["days"], hist["similar"], hist["vol_range_pct"][0],
-             hist["vol_range_pct"][1], hist["target_first"], hist["stop_first"], hist["neither"],
-             hist["step_bars"]), unsafe_allow_html=True)
-    else:
-        st.warning("Nem volt hasonló volatilitású történelmi időszak a teljes mintában (%d ablak)." %
-                   hist["windows"])
-    probs = output["probabilities"]
-    cols = st.columns(4)
-    cols[0].metric("🎯 Target előbb", "%.1f%%" % (probs["target"] * 100))
-    cols[1].metric("🛑 Stop előbb", "%.1f%%" % (probs["stop"] * 100))
-    cols[2].metric("⏱ Egyik sem", "%.1f%%" % (probs["neither"] * 100))
-    cols[3].metric("Volatilitás-skála", "×%.2f" % output["vol_scale"]["median"],
-                   "medián, ATR %.3f%%" % output["current_atr_pct"], delta_color="off")
-    st.plotly_chart(_odds_bar(probs), key="odds-bar", config={"displayModeBar": False})
+
+    win_prob = prediction["probability"] * 100.0
+    base_prob = prediction["base_rate"] * 100.0
+    edge = prediction["edge_pp"]
+    is_neg = win_prob < base_prob
+    st.markdown(
+        '<div class="hero"><div class="lbl">🤖 ML Győzelmi Valószínűség az aktuális setupra (Win Probability): '
+        '<b>%.1f%%</b></div>'
+        '<div class="val%s">%.1f%%</div>'
+        '<div class="sub">Történelmi alapráta: %.1f%% · Modell előny (Edge): <b>%+.1f százalékpont</b> · '
+        'Cél: <b>%s</b> (%+.2f%%, +%.1f×ATR) · Stop: <b>%s</b> (%+.2f%%, −%.1f×ATR)</div></div>' %
+        (win_prob, " neg" if is_neg else "", win_prob, base_prob, edge,
+         _fmt_price(prediction["target"]), prediction["target_pct"], cfg_ml["target_atr"],
+         _fmt_price(prediction["stop"]), prediction["stop_pct"], cfg_ml["stop_atr"]),
+        unsafe_allow_html=True)
+
+    st.markdown("#### 🏆 A 3 legfontosabb döntési faktor (Feature Importance)")
+    top3_cols = st.columns(3)
+    for idx, factor in enumerate(prediction["top_factors"]):
+        direction = "⬆️ növeli" if factor["effect"] >= 0 else "⬇️ csökkenti"
+        top3_cols[idx].metric(
+            "#%d · %s" % (idx + 1, factor["label"]),
+            "%.1f%% súly" % (factor["importance"] * 100),
+            "%s az esélyt (%+.1f pp) · érték: %.2f" % (direction, factor["effect"] * 100, factor["value"]),
+            delta_color="normal" if factor["effect"] >= 0 else "inverse")
+
+    metrics = bundle["metrics"]
+    m_cols = st.columns(4)
+    m_cols[0].metric("Tanító / Teszt minták", "%d / %d" % (bundle["n_train"], bundle["n_test"]))
+    m_cols[1].metric("Holdout ROC AUC", "%.3f" % metrics["auc"] if metrics["auc"] is not None else "N/A")
+    m_cols[2].metric("Holdout Brier Score", "%.4f" % metrics["brier"],
+                     "alap: %.4f" % metrics["brier_baseline"], delta_color="off")
+    m_cols[3].metric("Történelmi időtáv", "%.1f nap (%s)" % (bundle["span_days"], bundle["market"].upper()))
+
     left, right = st.columns(2)
-    left.plotly_chart(_histogram(output, sim_plan), key="sim-hist")
-    right.plotly_chart(_path_fan(output, sim_plan), key="sim-paths")
-    st.caption("%d futás (Monte Carlo) · seed %d · %d gyertyás blokkok · tartási idő %d gyertya · "
-               "%d történelmi nap · %s · %s gyertyák · a múltbeli trend kiszűrve (drift-mentes)" %
-               (output["runs"], output["seed"], output["block_size"], output["horizon_bars"],
-                output["historical_days"], saved["market"].upper(), saved["interval"]))
+    left.plotly_chart(_importance_chart(prediction["factors"]), key="ml-imp-chart")
+    right.plotly_chart(_calibration_chart(metrics["calibration"], prediction["base_rate"]), key="ml-cal-chart")
+
+    with st.expander("Összes bemeneti változó (Features) aktuális értéke és hatása"):
+        st.dataframe([
+            {"Faktor": f["label"],
+             "Fontosság (%)": "%.2f%%" % (f["importance"] * 100),
+             "Aktuális érték": "%.4g" % f["value"],
+             "Tipikus (medián)": "%.4g" % f["typical"],
+             "Lokális hatás (pp)": "%+.2f pp" % (f["effect"] * 100)}
+            for f in prediction["factors"]
+        ], hide_index=True)
 
 
 def _last_prices(interval):
@@ -663,19 +669,24 @@ def _last_prices(interval):
 
 
 def _render_open_positions(config, interval, refresh, auto):
-    fee = config.get("risk", {}).get("fee_rate", 0)
+    cfg_risk = config.get("risk", {})
+    fee = cfg_risk.get("fee_rate", 0)
+    slippage = cfg_risk.get("slippage_rate", 0)
 
     @st.fragment(run_every=refresh if auto else None)
     def positions():
+        data = _load_all(interval)
         open_trades = [t for t in list_trades(config=config) if t["status"] == "open"]
         if not open_trades:
-            st.info("Nincs nyitott paper pozíció.")
+            st.info("Nincs nyitott paper pozíció. (A Stop-Loss vagy Target elérésekor a rendszer "
+                    "minden élő frissítésnél automatikusan lezárja a pozíciókat.)")
             return
-        prices = _last_prices(interval)
+        prices = {symbol: res["bars"][-1]["close"]
+                  for symbol, res in data["results"].items() if res["bars"]}
         table, total = [], Decimal(0)
         for trade in open_trades:
             price = prices.get(trade["symbol"])
-            pnl = unrealized_pnl(trade, price, fee) if price is not None else None
+            pnl = unrealized_pnl(trade, price, fee, slippage) if price is not None else None
             cost = dec(trade["quantity"]) * dec(trade["entry_price"])
             total += pnl or 0
             table.append({"ID": trade["id"][:8], "Coin": trade["symbol"], "Mennyiség": trade["quantity"],
@@ -683,7 +694,7 @@ def _render_open_positions(config, interval, refresh, auto):
                           "Aktuális ár": _fmt_price(price) if price is not None else "—",
                           "Nem realizált P&L ($)": "%+.2f" % pnl if pnl is not None else "—",
                           "P&L (%)": "%+.2f%%" % float(pnl / cost * 100) if pnl is not None and cost else "—"})
-        st.metric("Nyitott pozíciók nem realizált P&L", _usd(total, signed=True))
+        st.metric("Nyitott pozíciók nem realizált P&L (díj + slippage után)", _usd(total, signed=True))
         st.dataframe(table, hide_index=True)
 
     positions()
@@ -763,7 +774,9 @@ def _render_paper_tab(config, interval, selected, result, refresh, auto):
 
 
 def _render_closing_and_history(config, interval):
-    fee = config.get("risk", {}).get("fee_rate", 0)
+    cfg_risk = config.get("risk", {})
+    fee = cfg_risk.get("fee_rate", 0)
+    slippage = cfg_risk.get("slippage_rate", 0)
     trades = list_trades(config=config)
     open_trades = [t for t in trades if t["status"] == "open"]
     closed = [t for t in trades if t["status"] == "closed"]
@@ -781,8 +794,9 @@ def _render_closing_and_history(config, interval):
                     price = _last_prices(interval).get(symbol) if use_market else manual
                     if price in (None, ""):
                         raise TradingError("Nincs elérhető kilépő ár")
-                    done = close_trade(trade_id, price, fee, config=config)
-                    st.success("Lezárva. Realizált P&L: %s" % _usd(done["realized_pnl_usd"], signed=True))
+                    done = close_trade(trade_id, price, fee, slippage, reason="manual", config=config)
+                    st.success("Lezárva. Realizált P&L (díj + slippage után): %s" %
+                               _usd(done["realized_pnl_usd"], signed=True))
                 except TradingError as exc:
                     st.error(str(exc))
         closed = [t for t in list_trades(config=config) if t["status"] == "closed"]
@@ -795,8 +809,10 @@ def _render_closing_and_history(config, interval):
     cols[0].metric("Realizált P&L", _usd(sum(pnls), signed=True))
     cols[1].metric("Lezárt kötések", len(closed))
     cols[2].metric("Nyerési arány", "%.0f%%" % (100 * sum(1 for p in pnls if p > 0) / len(pnls)))
+    reason_map = {"target": "🎯 Target (auto)", "stop": "🛑 Stop (auto)", "manual": "✋ Kézi"}
     st.dataframe([{"ID": t["id"][:8], "Coin": t["symbol"], "Mennyiség": t["quantity"],
                    "Entry": t["entry_price"], "Kilépő": t["exit_price"],
+                   "Mód": reason_map.get(t.get("exit_reason", "manual"), t.get("exit_reason", "—")),
                    "P&L ($)": "%+.2f" % float(dec(t["realized_pnl_usd"])), "Zárás (UTC)": t["exit_at"][:19]}
                   for t in reversed(closed)], hide_index=True)
 
@@ -913,7 +929,7 @@ def main():
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown('<div class="terminal-title"><span>◢</span> CRYPTO TERMINAL '
                 '<small style="color:#787b86;font-weight:400;font-size:.8rem">'
-                'helyi elemzés és paper trading · nincs valódi megbízás</small></div>',
+                'SMC struktúra, ML valószínűség és paper trading · nincs valódi megbízás</small></div>',
                 unsafe_allow_html=True)
     try:
         config = load_config()
@@ -943,13 +959,13 @@ def main():
     _render_ticker(config, interval, refresh, auto)
     rows, _, _ = _snapshot(config, interval)
     current = next(row for row in rows if row["symbol"] == selected)
-    tabs = st.tabs(["📊 Élő Chart & Scanner", "⏳ Time Machine",
+    tabs = st.tabs(["📊 Élő Chart & Scanner", "🤖 ML Valószínűség",
                     "💼 Paper Trading & Kockázat", "📰 Hírek, Hangulat & Riasztások"])
     with tabs[0]:
         layers = st.multiselect("Chart rétegek", LAYER_CHOICES, default=DEFAULT_LAYERS, key="chart_layers")
         _render_live_tab(config, interval, selected, candles, layers, refresh, auto)
     with tabs[1]:
-        _render_time_machine(config, interval, selected, current["signal"], current["advice"])
+        _render_ml_tab(config, interval, selected, current["result"])
     with tabs[2]:
         _render_paper_tab(config, interval, selected, current["result"], refresh, auto)
     with tabs[3]:

@@ -126,13 +126,14 @@ def record_entry(symbol, side, quantity, entry_price, stop=None, target=None,
     return trade
 
 
-def close_trade(trade_id, exit_price, fee_rate=Decimal("0"), config=None,
-                path=None, now=None):
+def close_trade(trade_id, exit_price, fee_rate=Decimal("0"), slippage_rate=Decimal("0"),
+                reason="manual", config=None, path=None, now=None):
     config = config or load_config()
     exit_value = dec(exit_price, "exit price")
     if exit_value <= 0:
         raise TradingError("Exit price must be above zero")
     fees = dec(fee_rate, "fee rate")
+    slippage = dec(slippage_rate, "slippage rate")
     target_path = _journal_path(config, path)
     with _LOCK:
         document = _load(target_path)
@@ -145,18 +146,73 @@ def close_trade(trade_id, exit_price, fee_rate=Decimal("0"), config=None,
         qty = dec(trade["quantity"])
         entry = dec(trade["entry_price"])
         notional = qty * (entry + exit_value)
-        pnl = qty * (exit_value - entry) - notional * fees
+        pnl = qty * (exit_value - entry) - notional * (fees + slippage)
         trade.update(status="closed", exit_price=format(exit_value, "f"),
-                     exit_at=_stamp(now), realized_pnl_usd=format(pnl, "f"))
+                     exit_at=_stamp(now), exit_reason=str(reason),
+                     realized_pnl_usd=format(pnl, "f"))
         _save(target_path, document)
     return trade
 
 
-def unrealized_pnl(trade, current_price, fee_rate=Decimal("0")):
+def auto_close_trades(quotes, fee_rate=Decimal("0"), slippage_rate=Decimal("0"),
+                      config=None, path=None, now=None):
+    """Automatically close open paper trades when price hits Stop-Loss or Target.
+
+    ``quotes`` maps symbol -> current price (or dict with ``price``, ``high``, ``low``).
+    If both stop and target are touched in the same update, stop wins (conservative).
+    """
+    config = config or load_config()
+    fees = dec(fee_rate, "fee rate")
+    slippage = dec(slippage_rate, "slippage rate")
+    target_path = _journal_path(config, path)
+    closed_now = []
+    with _LOCK:
+        document = _load(target_path)
+        changed = False
+        for trade in document["trades"]:
+            if trade.get("status") != "open":
+                continue
+            symbol = trade.get("symbol")
+            quote = (quotes or {}).get(symbol)
+            if quote is None:
+                continue
+            if isinstance(quote, dict):
+                price = dec(quote["price"], "price")
+                high = dec(quote.get("high", price), "high")
+                low = dec(quote.get("low", price), "low")
+            else:
+                price = high = low = dec(quote, "price")
+            stop = dec(trade["stop"], "stop") if trade.get("stop") not in (None, "") else None
+            target = dec(trade["target"], "target") if trade.get("target") not in (None, "") else None
+            hit_reason = None
+            exit_value = None
+            if stop is not None and (price <= stop or low <= stop):
+                hit_reason = "stop"
+                exit_value = min(price, stop)
+            elif target is not None and (price >= target or high >= target):
+                hit_reason = "target"
+                exit_value = target
+            if hit_reason is not None and exit_value is not None and exit_value > 0:
+                qty = dec(trade["quantity"])
+                entry = dec(trade["entry_price"])
+                notional = qty * (entry + exit_value)
+                pnl = qty * (exit_value - entry) - notional * (fees + slippage)
+                trade.update(status="closed", exit_price=format(exit_value, "f"),
+                             exit_at=_stamp(now), exit_reason=hit_reason,
+                             realized_pnl_usd=format(pnl, "f"))
+                closed_now.append(dict(trade))
+                changed = True
+        if changed:
+            _save(target_path, document)
+    return closed_now
+
+
+def unrealized_pnl(trade, current_price, fee_rate=Decimal("0"), slippage_rate=Decimal("0")):
     if trade.get("status") != "open":
         return dec(trade.get("realized_pnl_usd", "0"))
     qty = dec(trade["quantity"])
     entry = dec(trade["entry_price"])
     current = dec(current_price)
     fees = dec(fee_rate)
-    return qty * (current - entry) - qty * (entry + current) * fees
+    slippage = dec(slippage_rate)
+    return qty * (current - entry) - qty * (entry + current) * (fees + slippage)

@@ -1,5 +1,6 @@
-"""Scan the configured crypto watchlist with Binance public candle data."""
+"""Scan the configured crypto watchlist with Binance public candle data and SMC setup advisor."""
 
+import datetime
 import json
 import os
 import sys
@@ -9,7 +10,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from binance_client import BinanceClient, load_config
-from crypto_engine import evaluate_breakout
+from crypto_engine import analyze_setup
 
 
 def scan(client=None, config=None, now=None):
@@ -18,24 +19,22 @@ def scan(client=None, config=None, now=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=datetime.timezone.utc)
-    day_start = int(datetime.datetime.combine(now.date(), datetime.time(),
-                                              datetime.timezone.utc).timestamp() * 1000)
     interval = config["default_interval"]
-    limit = 1441 if interval == "1m" else 289
+    risk = config.get("risk", {})
+    cost_rate = float(risk.get("fee_rate", 0)) + float(risk.get("slippage_rate", 0))
     results = []
     for coin in config["symbols"]:
         symbol = coin["symbol"]
         try:
-            data = client.get_klines(symbol, interval, limit=limit, start_time=day_start,
-                                     end_time=int(now.timestamp() * 1000), include_open=True)
-            signal = evaluate_breakout(data["bars"], symbol, data["interval"], now,
-                                       config["opening_range_minutes"])
+            data = client.get_klines(symbol, interval, limit=500, include_open=True)
+            advice = analyze_setup(data["bars"], symbol, data["interval"], data["filters"],
+                                   now=now, cost_rate=cost_rate)
             price = data["bars"][-1]["close"] if data["bars"] else None
             results.append({"symbol": symbol, "price": price, "market": data["market"],
-                            "signal": signal, "error": None})
+                            "advice": advice, "error": None})
         except Exception as exc:
             results.append({"symbol": symbol, "price": None, "market": None,
-                            "signal": None, "error": str(exc)})
+                            "advice": None, "error": str(exc)})
     return results
 
 
@@ -44,9 +43,10 @@ def main():
     print(json.dumps([{"symbol": row["symbol"],
                        "price": format(row["price"], "f") if row["price"] is not None else None,
                        "market": row["market"],
-                       "status": row["signal"]["status"] if row["signal"] else "error",
+                       "rating": row["advice"]["rating"] if row["advice"] else "error",
+                       "score": row["advice"]["score"] if row["advice"] else None,
                        "error": row["error"]} for row in data], indent=2))
-    return 0 if any(row["signal"] for row in data) else 1
+    return 0 if any(row["advice"] for row in data) else 1
 
 
 if __name__ == "__main__":

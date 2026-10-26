@@ -10,9 +10,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import ml_model
 import technical_analysis as ta
-from crypto_engine import (TradingError, _first_hit, analyze_setup, build_plan, rating_for,
-                           simulate_trade)
+from crypto_engine import TradingError, analyze_setup, build_plan, rating_for
 
 STEP = 300_000
 START = int(datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc).timestamp() * 1000)
@@ -179,6 +179,22 @@ class PatternTests(unittest.TestCase):
         found = ta.chart_patterns(g, 0.3, 100.0, 99.0, [], [], STEP)
         self.assertTrue(any(p["key"].startswith("rolling_") for p in found))
 
+    def test_liquidity_sweep_detection(self):
+        closes = [100.0] * 40
+        f = ta.to_floats(make_bars(closes, spread=0.1))
+        # Create a clear swing low at index 15
+        f[15]["l"] = 95.0
+        f[15]["c"] = 96.0
+        # And a bullish liquidity sweep on the last bar (wick below 95, close above 95)
+        f[-1]["l"] = 94.2
+        f[-1]["c"] = 96.5
+        sh, sl = ta.swing_points([b["h"] for b in f], [b["l"] for b in f], 5)
+        sweeps = ta.liquidity_sweeps(f, len(f) - 1, sh, sl, 1.0, 5)
+        bull = next((s for s in sweeps if s["type"] == "bullish"), None)
+        self.assertIsNotNone(bull)
+        self.assertEqual(bull["level"], 95.0)
+        self.assertAlmostEqual(bull["sweep_price"], 94.2)
+
 
 class AdvisorTests(unittest.TestCase):
     def test_rating_thresholds(self):
@@ -253,50 +269,26 @@ class AdvisorTests(unittest.TestCase):
             build_plan("100", "99", 2, FILTERS, target="99.5")
 
 
-class SimulatorTests(unittest.TestCase):
-    def history(self, **kwargs):
-        bars = make_bars(random_walk(3000, kwargs.pop("sigma", 0.0005), **kwargs), spread=0.03)
-        return bars, after(bars)
+class MLModelTests(unittest.TestCase):
+    def test_train_and_predict_win_probability_and_top_factors(self):
+        closes = [100 + 0.02 * i + 2.5 * math.sin(i / 8.0) + 1.2 * math.cos(i / 3.0)
+                  for i in range(1100)]
+        volumes = [10.0 + (i % 7) * 2.0 for i in range(1100)]
+        bars = make_bars(closes, spread=0.25, volumes=volumes)
+        now = after(bars)
+        cfg = {"ml": {"min_train_samples": 300, "n_estimators": 50, "horizon_bars": 24}}
+        bundle = ml_model.train_model(bars, "5m", now=now, config=cfg)
+        self.assertGreaterEqual(bundle["samples"], 300)
+        self.assertEqual(len(bundle["importance"]), len(ml_model.FEATURE_KEYS))
+        pred = ml_model.predict_setup(bundle, bars, now=now)
+        self.assertTrue(0.0 <= pred["probability"] <= 1.0)
+        self.assertEqual(len(pred["top_factors"]), 3)
+        self.assertTrue(pred["stop"] < pred["entry"] < pred["target"])
 
-    def test_barrier_semantics(self):
-        self.assertEqual(_first_hit(100, 102, 98, 99, 101)[0], "stop")
-        self.assertEqual(_first_hit(100, 101.5, 99.5, 99, 101)[0], "target")
-        self.assertEqual(_first_hit(98.5, 99, 98, 99, 101), ("stop", 98.5))
-        self.assertEqual(_first_hit(100, 100.5, 99.5, 99, 101), (None, None))
-
-    def test_seeded_and_probabilities_sum_to_one(self):
-        bars, now = self.history()
-        first = simulate_trade(bars, "100", "99", "101", "5m", 2000, 7, now, 60)
-        second = simulate_trade(bars, "100", "99", "101", "5m", 2000, 7, now, 60)
-        self.assertEqual(first["counts"], second["counts"])
-        self.assertEqual(first["terminal_returns_pct"], second["terminal_returns_pct"])
-        self.assertAlmostEqual(sum(first["probabilities"].values()), 1.0)
-        self.assertEqual(first["method"], "block_bootstrap_vol_adjusted")
-        self.assertEqual(len(first["sample_paths"]), 40)
-        hist = first["historical"]
-        self.assertEqual(hist["target_first"] + hist["stop_first"] + hist["neither"], hist["similar"])
-        self.assertGreater(hist["similar"], 0)
-
-    def test_volatility_scaling_changes_outcomes(self):
-        bars, now = self.history()
-        atr_value = ta.last(ta.atr(*[[float(b[k]) for b in bars] for k in ("high", "low", "close")]))
-        calm = simulate_trade(bars, "100", "99", "101", "5m", 1500, 5, now, 36, current_atr=atr_value)
-        wild = simulate_trade(bars, "100", "99", "101", "5m", 1500, 5, now, 36, current_atr=atr_value * 5)
-        self.assertLess(wild["probabilities"]["neither"], calm["probabilities"]["neither"])
-        self.assertGreater(wild["vol_scale"]["median"], calm["vol_scale"]["median"] * 3)
-
-    def test_demeaning_removes_historical_drift(self):
-        bars, now = self.history(drift=0.0004, seed=11)
-        kept = simulate_trade(bars, "100", "99", "101", "5m", 1500, 5, now, 36, demean=False)
-        neutral = simulate_trade(bars, "100", "99", "101", "5m", 1500, 5, now, 36, demean=True)
-        self.assertGreater(kept["probabilities"]["target"], neutral["probabilities"]["target"])
-
-    def test_requires_enough_contiguous_candles(self):
-        bars = make_bars(random_walk(12, 0.001))
-        with self.assertRaises(TradingError):
-            simulate_trade(bars, "100", "99", "101", "5m", 100, 1, after(bars))
-        with self.assertRaises(TradingError):
-            simulate_trade(bars, "100", "101", "102", "5m", 100, 1, after(bars))
+    def test_insufficient_samples_raises_model_error(self):
+        bars = make_bars(random_walk(120, 0.002))
+        with self.assertRaises(ml_model.ModelError):
+            ml_model.train_model(bars, "5m", now=after(bars))
 
 
 if __name__ == "__main__":

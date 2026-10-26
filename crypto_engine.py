@@ -1,7 +1,9 @@
-"""Shared crypto signal, risk, sizing, setup-advisor, and Monte Carlo calculations."""
+"""Shared crypto setup advisor (indicators + geometry + SMC), risk, and sizing calculations.
+
+The ML win-probability model lives in ``ml_model.py``.
+"""
 
 import datetime
-import random
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 
 import technical_analysis as ta
@@ -39,61 +41,6 @@ def _interval_ms(interval):
     if interval == "5m":
         return 300_000
     raise TradingError("Interval must be 1m or 5m")
-
-
-def _utc_day(ms):
-    return datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).date()
-
-
-def evaluate_breakout(bars, symbol, interval="5m", now=None, or_minutes=15):
-    """Build one UTC-day opening range and find its first confirmed breakout."""
-    step_ms = _interval_ms(interval)
-    if or_minutes <= 0 or (or_minutes * 60_000) % step_ms:
-        raise TradingError("Opening range must be a positive whole number of %s bars" % interval)
-    now = now or datetime.datetime.now(datetime.timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=datetime.timezone.utc)
-    else:
-        now = now.astimezone(datetime.timezone.utc)
-    now_ms = int(now.timestamp() * 1000)
-    day_start = int(datetime.datetime.combine(now.date(), datetime.time(),
-                                               datetime.timezone.utc).timestamp() * 1000)
-    range_ms = or_minutes * 60_000
-    range_end = day_start + range_ms
-    closed = [bar for bar in bars if bar.get("close_time", 0) < now_ms
-              and day_start <= bar.get("open_time", -1) < day_start + 86_400_000]
-    closed.sort(key=lambda bar: bar["open_time"])
-    opening = [bar for bar in closed if bar["open_time"] < range_end]
-    base = {"symbol": symbol, "interval": interval, "date_utc": now.date().isoformat(),
-            "status": "forming", "opening_range": None, "signal": None,
-            "last_close": closed[-1]["close"] if closed else None}
-    if now_ms < range_end:
-        base["reason"] = "UTC daily opening range is still forming"
-        return base
-    expected = range_ms // step_ms
-    expected_starts = [day_start + offset * step_ms for offset in range(expected)]
-    opening_by_time = {bar["open_time"]: bar for bar in opening}
-    if any(timestamp not in opening_by_time for timestamp in expected_starts):
-        base.update(status="no_data", reason="Opening range has %d of %d closed bars" %
-                    (len(opening_by_time), expected))
-        return base
-    opening = [opening_by_time[timestamp] for timestamp in expected_starts]
-    high = max(bar["high"] for bar in opening)
-    low = min(bar["low"] for bar in opening)
-    base["opening_range"] = {"high": high, "low": low, "minutes": or_minutes,
-                             "bars": expected, "start_utc_ms": day_start,
-                             "end_utc_ms": range_end}
-    for bar in closed:
-        if bar["open_time"] < range_end:
-            continue
-        if bar["close"] > high:
-            base.update(status="triggered", reason="First closed candle above the UTC opening-range high",
-                        signal={"entry": bar["close"], "bar_open_time": bar["open_time"],
-                                "bar_close_time": bar["close_time"], "bar_high": bar["high"],
-                                "bar_low": bar["low"], "market": bar.get("market", "unknown")})
-            return base
-    base.update(status="waiting", reason="No closed candle has broken the opening-range high")
-    return base
 
 
 def build_plan(entry, stop, target_r, filters, side="long", target=None):
@@ -186,8 +133,8 @@ def rating_for(score):
     return "AVOID"
 
 
-def _trade_levels(entry, atr_value, supports, resistances):
-    """Smart stop and safe/extended targets from swing zones and ATR."""
+def _trade_levels(entry, atr_value, supports, resistances, sweep_low=None):
+    """Smart stop and safe/extended targets from swing zones, sweep wicks and ATR."""
     stop, stop_basis = entry - 1.5 * atr_value, "Entry − 1.5×ATR"
     support = next((z for z in supports if z["level"] < entry), None)
     if support:
@@ -195,6 +142,11 @@ def _trade_levels(entry, atr_value, supports, resistances):
         distance = entry - candidate
         if 0.75 * atr_value <= distance <= 2.5 * atr_value:
             stop, stop_basis = candidate, "a legközelebbi Swing Low támasz alatt"
+    if sweep_low is not None and sweep_low < entry:
+        # after a stop hunt the invalidation point is the sweep wick itself
+        candidate = sweep_low - 0.2 * atr_value
+        if 0.5 * atr_value <= entry - candidate <= 2.5 * atr_value:
+            stop, stop_basis = candidate, "a likviditás-lesöprés kanóca alatt"
     if stop <= 0:
         stop, stop_basis = entry * 0.98, "Entry − 2%"
     risk = entry - stop
@@ -268,17 +220,24 @@ def analyze_setup(bars, symbol="", interval="5m", filters=None, now=None, cost_r
     squeeze = ta.bollinger_squeeze(series["bb_width"])
 
     window = f[-400:]
-    swing_size = 5 if interval == "5m" else 8
+    swing_size = ta.swing_size(step_ms)
     swing_highs, swing_lows = ta.swing_points([b["h"] for b in window], [b["l"] for b in window],
                                               swing_size)
     supports, resistances = ta.support_resistance(window, swing_highs, swing_lows, price,
                                                   atr_value, len(window))
     structure = ta.market_structure(swing_highs, swing_lows, atr_value)
     candles = ta.candle_patterns(f, atr_value, series["ema20"])
-    charts = ta.chart_patterns(window, atr_value, ema20, ema50, swing_highs, swing_lows, step_ms)
+    charts = ta.chart_patterns(window, atr_value, ema20, ema50, swing_highs, swing_lows, step_ms,
+                               swing_size=swing_size)
+    sweeps = [p for p in charts if p["key"].endswith("_sweep")]
+    charts_geo = [p for p in charts if not p["key"].endswith("_sweep")]
+    bull_sweep = next((p for p in sweeps if p["type"] == "bullish"), None)
+    bear_sweep = next((p for p in sweeps if p["type"] == "bearish" and p["age"] <= 1), None)
+    sweep_low = bull_sweep["sweep_price"] if bull_sweep else None
     bullish_candles = [p for p in candles if p["type"] == "bullish"]
     bearish_candles = [p for p in candles if p["type"] == "bearish"]
-    bullish_charts = [p for p in charts if p["type"] == "bullish"]
+    bullish_charts = [p for p in charts_geo if p["type"] == "bullish"]
+    bearish_charts = [p for p in charts_geo if p["type"] == "bearish"]
 
     parts = []
 
@@ -348,7 +307,7 @@ def analyze_setup(bars, symbol="", interval="5m", filters=None, now=None, cost_r
     else:
         part("Struktúra", "Trendstruktúra", 4, 10, "warn", "Oldalazó / vegyes piaci struktúra")
 
-    levels = _trade_levels(price, atr_value, supports, resistances)
+    levels = _trade_levels(price, atr_value, supports, resistances, sweep_low)
     room = levels["room_r"]
     if room is None:
         part("Struktúra", "Tér felfelé", 8, 10, "ok", "Nincs közeli ellenállás az ár felett")
@@ -386,6 +345,16 @@ def analyze_setup(bars, symbol="", interval="5m", filters=None, now=None, cost_r
         else:
             part("Mintázat", "Bollinger", 0, 3, "bad", "Ár a Bollinger középvonal alatt")
 
+    # Smart Money Concepts: an untouched swing low swept and reclaimed is the
+    # classic institutional "stop hunt" long entry.
+    if bull_sweep:
+        part("SMC", "Likviditás-lesöprés", 8, 8, "ok",
+             "Bikás liquidity sweep %s: stop hunt a %.6g swing low alatt, visszazárás fölé" %
+             ("az utolsó gyertyán" if bull_sweep["age"] == 0 else "%d gyertyája" % bull_sweep["age"],
+              bull_sweep["level"]))
+    else:
+        part("SMC", "Likviditás-lesöprés", 0, 8, "warn", "Nincs friss bikás likviditás-lesöprés")
+
     extras = []
     if squeeze["active"]:
         extras.append({"status": "warn", "text": "Bollinger Squeeze: szűkülés, nagy kitörés közeleg "
@@ -395,12 +364,19 @@ def analyze_setup(bars, symbol="", interval="5m", filters=None, now=None, cost_r
             extras.append({"status": "bad", "text": "%s – %s" % (pattern["name"], pattern["detail"])})
         elif pattern["type"] == "neutral" and pattern["age"] == 0:
             extras.append({"status": "warn", "text": "Doji – bizonytalanság, várj megerősítésre"})
+    if bear_sweep:
+        extras.append({"status": "bad", "text": "%s – %s" % (bear_sweep["name"], bear_sweep["detail"])})
+    for pattern in bearish_charts:
+        extras.append({"status": "warn", "text": "%s (%s) – %s" % (
+            pattern["name"], "megerősítve" if pattern["status"] == "confirmed" else "kialakulóban",
+            pattern["detail"])})
     if levels["resistance_blocks_t1"]:
         extras.append({"status": "warn", "text": "Ellenállás van a T1 előtt (%.6g): a cél nehezebben "
                        "teljesül" % levels["resistance"]["low"]})
 
     earned, maximum = sum(p["earned"] for p in parts), sum(p["max"] for p in parts)
     penalty = 8 if any(p["age"] <= 1 for p in bearish_candles) else 0
+    penalty += 8 if bear_sweep else 0
     score = max(0, int(round(100.0 * earned / maximum)) - penalty) if maximum else 0
 
     near_resistance_bearish = any(
@@ -420,7 +396,7 @@ def analyze_setup(bars, symbol="", interval="5m", filters=None, now=None, cost_r
         "MACD pozitív": hist is not None and hist > 0,
         "RSI 40–68": rsi_value is not None and 40 <= rsi_value <= 68,
         "Átlag feletti volume": rvol_value is not None and rvol_value >= 1.0,
-        "Bikás minta": bool(recent_bullish or bullish_charts),
+        "Bikás minta": bool(recent_bullish or bullish_charts or bull_sweep),
     }
     gate_notes = []
     cost_pct_f = float(cost_rate) * 200 if cost_rate else 0.0
@@ -440,7 +416,7 @@ def analyze_setup(bars, symbol="", interval="5m", filters=None, now=None, cost_r
 
     entry_mode = "market"
     if rating == "BUY_WATCH" and ema20 and price - ema20 > 0.5 * atr_value:
-        levels = _trade_levels(ema20, atr_value, supports, resistances)
+        levels = _trade_levels(ema20, atr_value, supports, resistances, sweep_low)
         entry_mode = "pullback"
     entry = levels["entry"]
 
@@ -505,180 +481,10 @@ def analyze_setup(bars, symbol="", interval="5m", filters=None, now=None, cost_r
         reasons=reasons, breakdown=parts, conditions=conditions, avoid=avoid, structure=structure,
         supports=supports, resistances=resistances, advice=advice, vwap_mode=vwap_mode,
         squeeze=squeeze, forming=forming is not None,
+        smc={"bullish_sweep": bull_sweep, "bearish_sweep": bear_sweep,
+             "sweeps": sweeps, "geometry": charts_geo},
         indicators={"ema20": ema20, "ema50": ema50, "ema200": ema200, "vwap": vwap,
                     "rsi": rsi_value, "macd": macd_line, "macd_signal": macd_signal,
                     "macd_hist": hist, "atr": atr_value, "atr_pct": atr_value / price * 100,
                     "bb_up": bb_up, "bb_mid": bb_mid, "bb_low": bb_low, "rvol": rvol_value})
     return result
-
-
-def _first_hit(o, h, low, stop, target):
-    """Which barrier a bar touches first; both in one bar counts as the stop."""
-    if o <= stop:
-        return "stop", o
-    if o >= target:
-        return "target", o
-    hit_stop, hit_target = low <= stop, h >= target
-    if hit_stop:
-        return "stop", stop
-    if hit_target:
-        return "target", target
-    return None, None
-
-
-def simulate_trade(bars, entry, stop, target, interval="5m", runs=10_000, seed=19,
-                   now=None, max_steps=None, current_atr=None, block_size=None,
-                   demean=True, similar_vol_ratio=1.5):
-    """Volatility-adjusted block-bootstrap simulation of a long trade.
-
-    Contiguous blocks of historical candles are chained until the horizon is
-    reached. Each block's returns are rescaled by (current ATR% / ATR% at the
-    block start), so quiet history is not replayed at today's volatility and
-    vice versa. ``historical`` reports the deterministic hit rate of real
-    paths that started in a comparable volatility regime.
-    """
-    if not 1 <= int(runs) <= 100_000:
-        raise TradingError("Simulation runs must be between 1 and 100000")
-    step_ms = _interval_ms(interval)
-    entry, stop, target = dec(entry, "entry"), dec(stop, "stop"), dec(target, "target")
-    if not (0 < stop < entry < target):
-        raise TradingError("Long simulation requires stop < entry < target")
-    now = now or datetime.datetime.now(datetime.timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=datetime.timezone.utc)
-    now_ms = int(now.astimezone(datetime.timezone.utc).timestamp() * 1000)
-    block = int(block_size or (3_600_000 // step_ms))
-    horizon = int(max_steps or (12 * 3_600_000 // step_ms))
-    if block < 1 or horizon < 1:
-        raise TradingError("Block size and horizon must be positive")
-
-    closed = sorted((b for b in bars if b.get("close_time", 0) < now_ms),
-                    key=lambda b: b["open_time"])
-    f = ta.to_floats(closed)
-    n = len(f)
-    atr_series = ta.atr([b["h"] for b in f], [b["l"] for b in f], [b["c"] for b in f])
-    # atr_pct[i] is the volatility known *before* bar i starts.
-    atr_pct = [None] + [(atr_series[i - 1] / f[i - 1]["c"]) if atr_series[i - 1] and f[i - 1]["c"] > 0
-                        else None for i in range(1, n)]
-    entry_f, stop_f, target_f = float(entry), float(stop), float(target)
-    if current_atr is not None and float(current_atr) > 0:
-        current_pct = float(current_atr) / entry_f
-    elif n and atr_series[-1]:
-        current_pct = atr_series[-1] / f[-1]["c"]
-    else:
-        raise TradingError("Not enough historical candles to measure volatility")
-
-    breaks = [1] * n
-    ro, rh, rl, rc = [0.0] * n, [0.0] * n, [0.0] * n, [0.0] * n
-    for i in range(1, n):
-        previous = f[i - 1]["c"]
-        if f[i]["t"] - f[i - 1]["t"] == step_ms and previous > 0:
-            breaks[i] = 0
-            ro[i], rh[i] = f[i]["o"] / previous - 1, f[i]["h"] / previous - 1
-            rl[i], rc[i] = f[i]["l"] / previous - 1, f[i]["c"] / previous - 1
-    if demean:
-        usable = [i for i in range(1, n) if not breaks[i]]
-        drift = sum(rc[i] for i in usable) / len(usable) if usable else 0.0
-        for i in usable:
-            ro[i] -= drift
-            rh[i] -= drift
-            rl[i] -= drift
-            rc[i] -= drift
-    prefix = [0]
-    for flag in breaks:
-        prefix.append(prefix[-1] + flag)
-    starts = [i for i in range(1, n - block + 1)
-              if atr_pct[i] and prefix[i + block] - prefix[i] == 0]
-    if not starts:
-        raise TradingError("Not enough contiguous historical candles for the simulation")
-    scales = {i: min(4.0, max(0.25, current_pct / atr_pct[i])) for i in starts}
-
-    rng = random.Random(int(seed))
-    outcomes = {"target": 0, "stop": 0, "neither": 0}
-    terminal_returns, sample_paths = [], []
-    sample_limit = min(40, int(runs))
-    for _ in range(int(runs)):
-        sampling = len(sample_paths) < sample_limit
-        current, outcome, done = entry_f, "neither", 0
-        path = [entry_f] if sampling else None
-        while done < horizon and outcome == "neither":
-            begin = starts[rng.randrange(len(starts))]
-            scale = scales[begin]
-            for j in range(begin, begin + block):
-                if done >= horizon:
-                    break
-                o = current * (1 + scale * ro[j])
-                h = max(current * (1 + scale * rh[j]), o)
-                low = min(current * (1 + scale * rl[j]), o)
-                close = current * (1 + scale * rc[j])
-                h, low = max(h, close), min(low, close)
-                hit, price = _first_hit(o, h, low, stop_f, target_f)
-                done += 1
-                if hit:
-                    outcome, current = hit, price
-                    if sampling:
-                        path.append(price)
-                    break
-                current = close
-                if sampling:
-                    path.append(current)
-        outcomes[outcome] += 1
-        terminal_returns.append((current / entry_f - 1) * 100)
-        if sampling:
-            sample_paths.append(path)
-
-    historical = _historical_hit_rate(f, breaks, prefix, atr_pct, entry_f, stop_f, target_f,
-                                      current_pct, horizon, block, similar_vol_ratio)
-    total = float(runs)
-    warnings = []
-    span_days = n * step_ms / 86_400_000
-    if span_days < 14:
-        warnings.append("Csak %.1f napnyi történelmi adat áll rendelkezésre; az eredmény bizonytalan." %
-                        span_days)
-    if len(starts) < 100:
-        warnings.append("Kevés (%d) használható gyertyablokk; az eredmény bizonytalan." % len(starts))
-    if historical["similar"] < 20:
-        warnings.append("Csak %d hasonló volatilitású történelmi időszak van; a találati arány "
-                        "statisztikailag gyenge." % historical["similar"])
-    scale_values = sorted(scales.values())
-    return {"runs": int(runs), "seed": int(seed), "interval": interval,
-            "method": "block_bootstrap_vol_adjusted", "demeaned": bool(demean),
-            "probabilities": {name: count / total for name, count in outcomes.items()},
-            "counts": outcomes, "terminal_returns_pct": terminal_returns,
-            "sample_paths": sample_paths, "historical_days": int(span_days),
-            "horizon_bars": horizon, "block_size": block, "blocks_available": len(starts),
-            "current_atr_pct": current_pct * 100,
-            "vol_scale": {"median": scale_values[len(scale_values) // 2],
-                          "min": scale_values[0], "max": scale_values[-1]},
-            "historical": historical, "warnings": warnings}
-
-
-def _historical_hit_rate(f, breaks, prefix, atr_pct, entry, stop, target, current_pct,
-                         horizon, block, ratio):
-    """Replay real paths that began in a similar-volatility regime."""
-    n = len(f)
-    stop_ratio, target_ratio = stop / entry, target / entry
-    low_bound, high_bound = current_pct / ratio, current_pct * ratio
-    counts = {"target": 0, "stop": 0, "neither": 0}
-    windows = similar = 0
-    for i in range(1, n - horizon + 1, block):
-        if prefix[i + horizon] - prefix[i] != 0:
-            continue
-        windows += 1
-        if not (atr_pct[i] and low_bound <= atr_pct[i] <= high_bound):
-            continue
-        similar += 1
-        base = f[i - 1]["c"]
-        stop_level, target_level = base * stop_ratio, base * target_ratio
-        outcome = "neither"
-        for j in range(i, i + horizon):
-            hit, _ = _first_hit(f[j]["o"], f[j]["h"], f[j]["l"], stop_level, target_level)
-            if hit:
-                outcome = hit
-                break
-        counts[outcome] += 1
-    return {"windows": windows, "similar": similar, "target_first": counts["target"],
-            "stop_first": counts["stop"], "neither": counts["neither"],
-            "target_rate": counts["target"] / similar if similar else None,
-            "stop_rate": counts["stop"] / similar if similar else None,
-            "vol_range_pct": [low_bound * 100, high_bound * 100], "step_bars": block}

@@ -12,9 +12,9 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from binance_client import BinanceClient, BinanceError, load_config
-from crypto_engine import (TradingError, evaluate_breakout, simulate_trade,
+from crypto_engine import (TradingError, analyze_setup,
                            size_position, validate_risk)
-from paper_trading import close_trade, list_trades, record_entry, unrealized_pnl
+from paper_trading import auto_close_trades, close_trade, list_trades, record_entry, unrealized_pnl
 
 
 def module_from_file(name, relative):
@@ -118,24 +118,6 @@ def candle(open_ms, interval_ms, o, h, low, close, market="spot"):
 
 
 class CryptoEngineTests(unittest.TestCase):
-    def test_utc_midnight_opening_range_and_closed_breakout(self):
-        start = int(datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc).timestamp() * 1000)
-        bars = [candle(start + i * 300_000, 300_000, 100, 102, 98, 101)
-                for i in range(3)]
-        bars.append(candle(start + 3 * 300_000, 300_000, 102, 104, 101, 103))
-        now = datetime.datetime(2026, 1, 1, 0, 25, tzinfo=datetime.timezone.utc)
-        result = evaluate_breakout(bars, "BTCUSDT", "5m", now, 15)
-        self.assertEqual(result["status"], "triggered")
-        self.assertEqual(result["opening_range"]["high"], Decimal("102"))
-        self.assertEqual(result["signal"]["entry"], Decimal("103"))
-
-    def test_missing_range_bar_does_not_create_signal(self):
-        start = int(datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc).timestamp() * 1000)
-        bars = [candle(start, 300_000, 100, 102, 98, 101),
-                candle(start + 600_000, 300_000, 100, 102, 98, 101)]
-        now = datetime.datetime(2026, 1, 1, 0, 20, tzinfo=datetime.timezone.utc)
-        self.assertEqual(evaluate_breakout(bars, "BTCUSDT", "5m", now, 15)["status"], "no_data")
-
     def test_fractional_sizing_uses_decimal_step_and_usd_risk(self):
         filters = {"step_size": "0.0001", "min_qty": "0.0001",
                    "tick_size": "0.01", "min_notional": "5"}
@@ -234,10 +216,38 @@ class PaperTradingTests(unittest.TestCase):
                                  trade_id="paper-1")
             self.assertEqual(trade["quantity"], "0.0025")
             self.assertEqual(unrealized_pnl(trade, "61000"), Decimal("2.5000"))
-            closed = close_trade("paper-1", "61000", config=config, path=path)
+            self.assertEqual(unrealized_pnl(trade, "61000", fee_rate="0.001", slippage_rate="0.0005"),
+                             Decimal("2.046250000"))
+            closed = close_trade("paper-1", "61000", fee_rate="0.001", slippage_rate="0.0005",
+                                 config=config, path=path)
             self.assertEqual(closed["status"], "closed")
-            self.assertEqual(Decimal(closed["realized_pnl_usd"]), Decimal("2.5000"))
+            self.assertEqual(Decimal(closed["realized_pnl_usd"]), Decimal("2.046250000"))
             self.assertEqual(list_trades(config=config, path=path)[0]["id"], "paper-1")
+
+    def test_auto_close_trades_hits_stop_and_target_with_slippage(self):
+        config = load_config()
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "paper.json")
+            record_entry("BTCUSDT", "long", "1", "100", "95", "110",
+                         config=config, path=path, trade_id="t-stop")
+            record_entry("ETHUSDT", "long", "2", "200", "190", "220",
+                         config=config, path=path, trade_id="t-target")
+            closed = auto_close_trades(
+                {"BTCUSDT": {"price": "96", "high": "99", "low": "94.5"},
+                 "ETHUSDT": {"price": "221", "high": "222", "low": "205"}},
+                fee_rate="0.001", slippage_rate="0.0005", config=config, path=path)
+            self.assertEqual(len(closed), 2)
+            by_id = {t["id"]: t for t in list_trades(config=config, path=path)}
+            self.assertEqual(by_id["t-stop"]["status"], "closed")
+            self.assertEqual(by_id["t-stop"]["exit_reason"], "stop")
+            self.assertEqual(Decimal(by_id["t-stop"]["exit_price"]), Decimal("95"))
+            # 1 * (95 - 100) - 1 * (100 + 95) * 0.0015 = -5 - 0.2925 = -5.2925
+            self.assertEqual(Decimal(by_id["t-stop"]["realized_pnl_usd"]), Decimal("-5.2925"))
+            self.assertEqual(by_id["t-target"]["status"], "closed")
+            self.assertEqual(by_id["t-target"]["exit_reason"], "target")
+            self.assertEqual(Decimal(by_id["t-target"]["exit_price"]), Decimal("220"))
+            # 2 * (220 - 200) - 2 * (200 + 220) * 0.0015 = 40 - 1.26 = 38.74
+            self.assertEqual(Decimal(by_id["t-target"]["realized_pnl_usd"]), Decimal("38.74"))
 
 
 if __name__ == "__main__":
