@@ -1,4 +1,4 @@
-"""Crypto terminal: live SMC scanner, chart, ML setup classifier, paper journal, alerts."""
+"""Crypto terminal: live SMC + MTF scanner, chart, ML setup classifier, backtester, paper journal, alerts."""
 
 import concurrent.futures
 import datetime
@@ -11,7 +11,9 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from binance_client import INTERVAL_MS, BinanceClient, ROOT, load_config
+import bot
 import ml_model
+import mtf
 import technical_analysis as ta
 from crypto_engine import (TradingError, analyze_setup, build_plan, dec,
                            size_position, validate_risk)
@@ -20,7 +22,7 @@ from paper_trading import (auto_close_trades, close_trade, daily_risk, list_trad
 
 CACHE_TTL_SECONDS = 5
 REFRESH_CHOICES = (5, 10, 30)
-DEFAULT_TARGET_R = Decimal("2")
+DEFAULT_TARGET_R = Decimal("2.5")
 UP, DOWN, ACCENT = "#26a69a", "#ef5350", "#2962ff"
 BG, GRID, MUTED = "#131722", "#2a2e39", "#787b86"
 UTC = datetime.timezone.utc
@@ -79,8 +81,13 @@ _alerts = _load_module("crypto_alerts_module", "trader-alerts", "alerts.py")
 
 
 @st.cache_resource
-def _client():
+def _client(version=3):
     return BinanceClient(load_config())
+
+
+@st.cache_resource
+def _htf_cache(version=3):
+    return mtf.HTFCache(_client(), ttl=120)
 
 
 def _fetch_symbol(client, symbol, interval, kwargs, cost_rate, now):
@@ -89,8 +96,12 @@ def _fetch_symbol(client, symbol, interval, kwargs, cost_rate, now):
     except Exception as exc:
         return None, None, str(exc)
     try:
+        htf_state = _htf_cache().state(symbol, int(now.timestamp() * 1000))
+    except Exception:
+        htf_state = None
+    try:
         advice = analyze_setup(result["bars"], symbol, interval, result["filters"],
-                               now=now, cost_rate=cost_rate)
+                               now=now, cost_rate=cost_rate, htf=htf_state)
     except Exception as exc:
         advice = {"status": "error", "reasons": [{"status": "bad", "text": "Elemzési hiba: %s" % exc}]}
     return result, advice, None
@@ -233,12 +244,16 @@ def _render_ticker(config, interval, refresh, auto):
                     advice = row["advice"]
                     if advice:
                         trend_txt = TREND_LABELS.get(advice["structure"]["trend"], "—")
+                        mtf_lbl = advice["mtf"]["label"] if advice.get("mtf") else "—"
+                        mtf_det = advice["mtf"]["detail"] if advice.get("mtf") else ""
                         st.markdown(
                             '<span class="sig sig-%s">%s · %d</span><span class="src">%s%s</span>'
+                            '<div class="mini" title="%s">🧭 Makro (1h/4h): <b>%s</b></div>'
                             '<div class="mini" title="%s">🕯 %s</div>'
                             '<div class="mini">%s · 🎯 T1 <b>%+.2f%%</b> · SL <b>%+.2f%%</b></div>' %
                             (advice["rating"].lower(), advice["short_label"], advice["score"],
-                             market, stale, advice["pattern_summary"], advice["pattern_summary"],
+                             market, stale, mtf_det, mtf_lbl,
+                             advice["pattern_summary"], advice["pattern_summary"],
                              trend_txt, advice["t1_pct"] or 0, advice["stop_pct"] or 0),
                             unsafe_allow_html=True)
                     else:
@@ -370,6 +385,7 @@ def _scanner_table(rows):
             if sweeps:
                 s = sweeps[0]
                 smc_summary = ("🟢 Bikás Sweep" if s["type"] == "bullish" else "🔴 Medvés Sweep")
+        mtf_label = advice["mtf"]["label"] if advice and advice.get("mtf") else "—"
         table.append({
             "Coin": row["symbol"],
             "Ár (USDT)": _fmt_price(row["price"]) if row["price"] is not None else "—",
@@ -377,6 +393,7 @@ def _scanner_table(rows):
                     if change is not None else "—"),
             "Setup Score": advice["score"] if advice else None,
             "Tanács": advice["short_label"] if advice else "—",
+            "Makro Trend (1h/4h)": mtf_label,
             "Piaci struktúra": TREND_LABELS.get(advice["structure"]["trend"], "—") if advice else "—",
             "SMC / Likviditás": smc_summary,
             "Mintázat": advice["pattern_summary"] if advice else "—",
@@ -391,21 +408,24 @@ def _scanner_table(rows):
 def _load_advisor_plan(config, selected, advice, filters):
     """Copy the advisor's levels into the calculator and active plan."""
     cfg_risk = config.get("risk", {})
+    scale = float(advice.get("position_scale", 1.0)) if advice.get("position_scale") else 1.0
     plan = build_plan(advice["entry"], advice["stop"], DEFAULT_TARGET_R, filters, target=advice["t1"])
     size = size_position(plan["entry"], plan["stop"], cfg_risk.get("risk_per_trade_usd", 50), filters,
                          cfg_risk.get("max_position_usd"), cfg_risk.get("fee_rate", 0),
-                         cfg_risk.get("slippage_rate", 0))
+                         cfg_risk.get("slippage_rate", 0),
+                         size_multiplier=format(scale, ".4g"))
     st.session_state["last_plan"] = {
         "symbol": selected, "entry": str(plan["entry"]), "stop": str(plan["stop"]),
         "target": str(plan["target"]), "t2": str(advice["t2"]), "quantity": str(size["quantity"]),
         "notional": str(size["notional_usd"]), "loss": str(size["estimated_loss_usd"]),
-        "step": str(size["step_size"]), "source": "Okos Tanácsadó (betöltve)"}
+        "step": str(size["step_size"]),
+        "source": "Okos Tanácsadó (betöltve · %.0f%% méret)" % (scale * 100)}
     for name, value in (("entry", plan["entry"]), ("stop", plan["stop"]), ("target", plan["target"])):
         st.session_state["calc_%s_%s" % (name, selected)] = _plain(value)
 
 
 def _render_advisor(config, selected, advice, filters):
-    st.subheader("🧠 Okos Tanácsadó, Geometriai Alakzatok & SMC")
+    st.subheader("🧠 Okos Tanácsadó, Makro Trend (1h/4h) & SMC")
     if not advice or advice.get("status") != "ok":
         text = advice["advice"] if advice and advice.get("advice") else "Az elemzés nem elérhető."
         st.info(text)
@@ -459,6 +479,9 @@ def _render_advisor(config, selected, advice, filters):
         trend = {"uptrend": "📈 Emelkedő trend (HH + HL)", "downtrend": "📉 Csökkenő trend (LH + LL)",
                  "range": "↔️ Oldalazó / vegyes struktúra"}[advice["structure"]["trend"]]
         st.markdown("**Piaci struktúra:** %s" % trend)
+        if advice.get("mtf"):
+            st.markdown("**Makro Trend (1h/4h):** %s — <small>%s</small>" %
+                        (advice["mtf"]["label"], advice["mtf"]["detail"]), unsafe_allow_html=True)
         ind = advice["indicators"]
         st.caption("RSI %.0f · MACD hiszt. %+.4g · ATR %.3f%% · RVOL %s · VWAP: %s" %
                    (ind["rsi"] or 0, ind["macd_hist"] or 0, ind["atr_pct"],
@@ -493,14 +516,18 @@ def _render_live_tab(config, interval, selected, candles, layers, refresh, auto)
                      (selected, row["error"] or "üres válasz"))
         else:
             plan = _active_plan(selected, advice, actionable_only=True)
-            columns = st.columns(4)
+            columns = st.columns(5)
             columns[0].metric("Ár (USDT)", _fmt_price(row["price"]),
                               "%+.2f%% (24h)" % float(row["change"]) if row["change"] is not None else None)
             columns[1].metric("Tanács", advice["short_label"] if advice else "—",
                               "Score %d" % advice["score"] if advice else None, delta_color="off")
-            columns[2].metric("Piaci struktúra (SMC)",
+            mtf_info = advice.get("mtf") if advice else None
+            columns[2].metric("Makro Trend (1h/4h)",
+                              mtf_info["label"] if mtf_info else "—",
+                              mtf_info["detail"] if mtf_info else None, delta_color="off")
+            columns[3].metric("Piaci struktúra (SMC)",
                               TREND_LABELS.get(advice["structure"]["trend"], "—") if advice else "—")
-            columns[3].metric("Adatforrás", result["market"].upper())
+            columns[4].metric("Adatforrás", result["market"].upper())
             st.plotly_chart(_candlestick(selected, result, plan, candles, layers, advice),
                             key="live-chart", config={"displaylogo": False, "scrollZoom": True})
             st.caption("Entry/Stop/Target: %s. Az indikátorok és alakzatok lezárt gyertyákból számolódnak." %
@@ -524,10 +551,15 @@ def _load_trained_ml(symbol, interval, days):
     step = INTERVAL_MS[interval]
     bars_per_day = 86_400_000 // step
     days = min(int(days), max(3, 20_000 // bars_per_day))
+    end_ms = int(now.timestamp() * 1000)
     start = int((now - datetime.timedelta(days=days)).timestamp() * 1000)
     history = client.get_klines(symbol, interval, limit=days * bars_per_day,
-                                start_time=start, end_time=int(now.timestamp() * 1000))
-    bundle = ml_model.train_model(history["bars"], interval, now=now, config=config)
+                                start_time=start, end_time=end_ms)
+    try:
+        htf_bars = mtf.fetch_htf(client, symbol, start, end_ms)
+    except Exception:
+        htf_bars = None
+    bundle = ml_model.train_model(history["bars"], interval, now=now, config=config, htf_bars=htf_bars)
     bundle["symbol"] = symbol
     bundle["market"] = history["market"]
     bundle["days"] = days
@@ -581,23 +613,98 @@ def _calibration_chart(calibration, base_rate):
     return fig
 
 
+def _render_backtest_section(config, interval, selected):
+    st.divider()
+    st.subheader("⏪ Walk-Forward Backtester & Auto-Paper Robot (`bot.py`)")
+    st.caption(
+        "Teszteld a stratégiát múltbeli gyertyákon (jövőbelátás nélkül, walk-forward újratanítással és "
+        "1h/4h EMA50 makro szűrővel), vagy futtasd önálló háttérfolyamatként: "
+        "`python bot.py backtest %s --days 90` · `python bot.py paper`" % selected)
+    cfg_ml = ml_model.settings(config)
+    dyn_pct = cfg_ml["auto_threshold"] * 100.0
+    be_pct = cfg_ml["breakeven"] * 100.0
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+    bt_days = c1.number_input("Történelem (nap)", min_value=15, max_value=180, value=90, step=15,
+                              key="bt_days_" + selected)
+    bt_train = c2.number_input("Kezdeti tanítás (nap)", min_value=7, max_value=90, value=30, step=5,
+                               key="bt_train_" + selected)
+    bt_thresh = c3.slider(
+        "Dinamikus +EV Küszöb (%)", min_value=20, max_value=85,
+        value=int(round(dyn_pct)), step=1,
+        help="Alapértelmezett: 1.25 × Break-even Win Rate (%.1f%% × 1.25 = %.1f%%)" % (be_pct, dyn_pct),
+        key="bt_thresh_" + selected)
+    bt_mtf = c4.checkbox("1h/4h EMA50 szűrő kötelező", value=True, key="bt_mtf_" + selected)
+
+    b_col1, b_col2 = st.columns(2)
+    if b_col1.button("▶️ Walk-Forward Backtest indítása (%s · %s)" % (selected, interval), type="primary"):
+        try:
+            status = st.empty()
+            with st.spinner("Múltbeli adatok letöltése és gyertyáról gyertyára történő szimuláció..."):
+                rep = bot.run_backtest(
+                    selected, interval=interval, days=float(bt_days), train_days=float(bt_train),
+                    retrain_days=2.0, threshold=bt_thresh / 100.0, require_mtf=bt_mtf,
+                    config=config, client=_client(), progress=lambda msg: status.caption(msg))
+                saved_path = bot.save_report(rep, csv_too=True)
+            status.empty()
+            st.session_state["last_backtest_" + selected] = (rep, saved_path)
+        except Exception as exc:
+            st.error("Backtest hiba: %s" % exc)
+
+    if b_col2.button("🤖 Auto-Paper Robot: 1 ciklus futtatása most (összes coin)", type="secondary"):
+        try:
+            with st.spinner("Auto-Paper ciklus futtatása (ML > %.0f%% + 1h/4h Makro Trend)..." % bt_thresh):
+                pbot = bot.PaperBot(config=config, client=_client(), interval=interval,
+                                    threshold=bt_thresh / 100.0)
+                opened = pbot.cycle()
+            if opened:
+                st.success("🤖 Auto-Paper nyitott %d új pozíciót: %s" %
+                           (len(opened), ", ".join("%s @ %s" % (t["symbol"], t["entry_price"]) for t in opened)))
+            else:
+                st.info("A ciklus lefutott: jelenleg egyik coin sem haladta meg az ML > %.0f%% + 1h/4h Bikás "
+                        "feltételt (vagy már van nyitott pozíció)." % bt_thresh)
+        except Exception as exc:
+            st.error("Auto-Paper hiba: %s" % exc)
+
+    saved_bt = st.session_state.get("last_backtest_" + selected)
+    if saved_bt:
+        rep, saved_path = saved_bt
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Total Profit", "%+.2f USD" % rep["total_profit_usd"],
+                  "%+.2f%%" % rep["return_pct"])
+        m2.metric("Win Rate", "%.1f%%" % (rep["win_rate"] * 100) if rep["win_rate"] is not None else "—",
+                  "Break-even: %.1f%% · +EV küszöb: %.1f%%" % (
+                      rep.get("breakeven_win_rate", 0) * 100,
+                      rep.get("required_ev_threshold", rep["strategy"]["threshold"]) * 100), delta_color="off")
+        m3.metric("Max Drawdown", "%.2f USD" % rep["max_drawdown_usd"],
+                  "%.2f%%" % rep["max_drawdown_pct"], delta_color="inverse")
+        m4.metric("Profit Factor", "%.2f" % rep["profit_factor"] if rep["profit_factor"] is not None else "—",
+                  "Átlag R: %+.2f" % rep["avg_r"] if rep["avg_r"] is not None else None, delta_color="off")
+        m5.metric("Buy & Hold (ugyanekkor)", "%+.2f%%" % rep["buy_and_hold_pct"])
+        st.caption("Mentve: `%s.json`" % saved_path)
+        with st.expander("Részletes Backtest riport és kötéslista", expanded=False):
+            st.code(bot.format_report(rep), language="text")
+            if rep["trade_list"]:
+                st.dataframe(rep["trade_list"], hide_index=True)
+
+
 def _render_ml_tab(config, interval, selected, result):
-    st.subheader("🤖 ML Valószínűségi Osztályozó (RandomForestClassifier)")
+    st.subheader("🤖 ML Valószínűségi Osztályozó (RandomForestClassifier + 1h/4h MTF)")
     cfg_ml = ml_model.settings(config)
     st.caption(
         "Helyben tanuló gépi tanulási modell (`scikit-learn RandomForestClassifier`), amely a múltbeli "
         "gyertyák geometriai alakzataiból, SMC likviditás-lesöpréseiből, relatív forgalmából (RVOL), "
-        "ATR volatilitásából és a mozgóátlagoktól való távolságból becsüli meg annak valószínűségét, "
-        "hogy az aktuális setup eléri az **%.1f×ATR célárat** az **%.1f×ATR stop** előtt (%d gyertyán belül)." %
+        "ATR volatilitásából, a mozgóátlagoktól való távolságból és a **magasabb idősíkú (1h/4h EMA50) "
+        "makro trendből** becsüli meg annak valószínűségét, hogy az aktuális setup eléri az "
+        "**%.1f×ATR célárat** az **%.1f×ATR stop** előtt (%d gyertyán belül)." %
         (cfg_ml["target_atr"], cfg_ml["stop_atr"], cfg_ml["horizon_bars"]))
 
     if not result or not result.get("bars"):
         st.warning("Nincs elérhető piaci adat a(z) %s párhoz." % selected)
         return
 
-    default_days = int(config.get("history_days", 30))
+    default_days = int(config.get("history_days", 60))
     col_btn, col_days = st.columns([3, 1])
-    days = col_days.number_input("Tanító időszak (nap)", min_value=5, max_value=60, value=default_days, step=5,
+    days = col_days.number_input("Tanító időszak (nap)", min_value=5, max_value=180, value=default_days, step=5,
                                  key="ml_days_" + selected)
     retrain = col_btn.button("🔄 Modell újratanítása a legfrissebb történelmi adatokon", type="secondary")
     if retrain:
@@ -606,7 +713,11 @@ def _render_ml_tab(config, interval, selected, result):
     try:
         with st.spinner("Helyi RandomForest modell tanítása és kiértékelése (%s · %s)..." % (selected, interval)):
             bundle = _load_trained_ml(selected, interval, days)
-            prediction = ml_model.predict_setup(bundle, result["bars"])
+            try:
+                live_htf = _htf_cache().get(selected)
+            except Exception:
+                live_htf = None
+            prediction = ml_model.predict_setup(bundle, result["bars"], htf_bars=live_htf)
     except Exception as exc:
         st.error("Az ML modell nem futtatható: %s" % exc)
         return
@@ -615,16 +726,38 @@ def _render_ml_tab(config, interval, selected, result):
         st.warning(warning)
 
     win_prob = prediction["probability"] * 100.0
+    raw_prob = prediction["raw_probability"] * 100.0
     base_prob = prediction["base_rate"] * 100.0
+    be_prob = prediction["breakeven"] * 100.0
+    req_prob = prediction["required_threshold"] * 100.0
     edge = prediction["edge_pp"]
-    is_neg = win_prob < base_prob
+    is_neg = win_prob < req_prob
+    mtf_state = prediction.get("mtf")
+    mtf_lbl = mtf_state["label"] if mtf_state else "⚪ Ismeretlen"
+    mtf_det = mtf_state["detail"] if mtf_state else ""
+    size_mult = prediction.get("size_multiplier", 1.0)
+    if prediction.get("mtf_allow_long") is False:
+        st.warning(
+            "🧭 **Makro Trend szűrő aktív (%s):** %s. Mivel az 1h idősíkon az árfolyam "
+            "nincs az EMA50 felett, a modell nyers becslése (**%.1f%%**) az alaprátában (**%.1f%%**) "
+            "maximalizálva lett, és vételi jelzés nem adható." %
+            (mtf_lbl, mtf_det, raw_prob, base_prob))
+    elif size_mult == 0.5:
+        st.info(
+            "🧭 **Rugalmas MTF szűrő (%s):** %s. Az 1h trend bikás, de a 4h még nem, ezért a belépés "
+            "**50%%-os (felezett) kockázattal és pozíciómérettel** engedélyezett." %
+            (mtf_lbl, mtf_det))
     st.markdown(
         '<div class="hero"><div class="lbl">🤖 ML Győzelmi Valószínűség az aktuális setupra (Win Probability): '
-        '<b>%.1f%%</b></div>'
+        '<b>%.1f%%</b> · Makro Trend (1h/4h): <b>%s</b></div>'
         '<div class="val%s">%.1f%%</div>'
-        '<div class="sub">Történelmi alapráta: %.1f%% · Modell előny (Edge): <b>%+.1f százalékpont</b> · '
+        '<div class="sub">Dinamikus Küszöb (Required +EV Threshold): <b>%.1f%%</b> '
+        '(%.2f× Break-even WR: <b>%.1f%%</b>) · Történelmi alapráta: %.1f%% · Edge: <b>%+.1f pp</b> · '
+        'Auto-Paper jelzés (≥%.1f%% + MTF): <b>%s</b><br>'
         'Cél: <b>%s</b> (%+.2f%%, +%.1f×ATR) · Stop: <b>%s</b> (%+.2f%%, −%.1f×ATR)</div></div>' %
-        (win_prob, " neg" if is_neg else "", win_prob, base_prob, edge,
+        (win_prob, mtf_lbl, " neg" if is_neg else "", win_prob, req_prob,
+         prediction.get("ev_multiplier", 1.25), be_prob, base_prob, edge, req_prob,
+         "🟢 AKTÍV +EV VÉTEL" if prediction.get("signal") else "⏸ VÁRAKOZÁS",
          _fmt_price(prediction["target"]), prediction["target_pct"], cfg_ml["target_atr"],
          _fmt_price(prediction["stop"]), prediction["stop_pct"], cfg_ml["stop_atr"]),
         unsafe_allow_html=True)
@@ -661,6 +794,8 @@ def _render_ml_tab(config, interval, selected, result):
             for f in prediction["factors"]
         ], hide_index=True)
 
+    _render_backtest_section(config, interval, selected)
+
 
 def _last_prices(interval):
     data = _load_all(interval)
@@ -693,7 +828,8 @@ def _render_open_positions(config, interval, refresh, auto):
                           "Entry": trade["entry_price"], "Stop": trade["stop"], "Target": trade["target"],
                           "Aktuális ár": _fmt_price(price) if price is not None else "—",
                           "Nem realizált P&L ($)": "%+.2f" % pnl if pnl is not None else "—",
-                          "P&L (%)": "%+.2f%%" % float(pnl / cost * 100) if pnl is not None and cost else "—"})
+                          "P&L (%)": "%+.2f%%" % float(pnl / cost * 100) if pnl is not None and cost else "—",
+                          "Megjegyzés": trade.get("note", "")})
         st.metric("Nyitott pozíciók nem realizált P&L (díj + slippage után)", _usd(total, signed=True))
         st.dataframe(table, hide_index=True)
 
@@ -929,7 +1065,7 @@ def main():
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown('<div class="terminal-title"><span>◢</span> CRYPTO TERMINAL '
                 '<small style="color:#787b86;font-weight:400;font-size:.8rem">'
-                'SMC struktúra, ML valószínűség és paper trading · nincs valódi megbízás</small></div>',
+                'SMC struktúra, 1h/4h Makro Trend, ML valószínűség, Backtester és Auto-Paper Trading</small></div>',
                 unsafe_allow_html=True)
     try:
         config = load_config()
@@ -953,13 +1089,14 @@ def main():
             disabled=not auto, key="refresh_seconds") or 10
         if st.button("🔄 Frissítés most", width="stretch"):
             _load_all.clear()
+            _htf_cache.clear()
         st.caption("Adatforrás: Binance publikus API (Spot, GRASS: USD-M Futures). "
                    "A piaci adat gyorsítótára legfeljebb %d mp." % CACHE_TTL_SECONDS)
 
     _render_ticker(config, interval, refresh, auto)
     rows, _, _ = _snapshot(config, interval)
     current = next(row for row in rows if row["symbol"] == selected)
-    tabs = st.tabs(["📊 Élő Chart & Scanner", "🤖 ML Valószínűség",
+    tabs = st.tabs(["📊 Élő Chart & Scanner", "🤖 ML Valószínűség & Backtester",
                     "💼 Paper Trading & Kockázat", "📰 Hírek, Hangulat & Riasztások"])
     with tabs[0]:
         layers = st.multiselect("Chart rétegek", LAYER_CHOICES, default=DEFAULT_LAYERS, key="chart_layers")

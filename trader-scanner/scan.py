@@ -11,6 +11,7 @@ if ROOT not in sys.path:
 
 from binance_client import BinanceClient, load_config
 from crypto_engine import analyze_setup
+import mtf
 
 
 def scan(client=None, config=None, now=None):
@@ -22,13 +23,19 @@ def scan(client=None, config=None, now=None):
     interval = config["default_interval"]
     risk = config.get("risk", {})
     cost_rate = float(risk.get("fee_rate", 0)) + float(risk.get("slippage_rate", 0))
+    htf_cache = mtf.HTFCache(client, ttl=120)
+    now_ms = int(now.timestamp() * 1000)
     results = []
     for coin in config["symbols"]:
         symbol = coin["symbol"]
         try:
             data = client.get_klines(symbol, interval, limit=500, include_open=True)
+            try:
+                htf_state = htf_cache.state(symbol, now_ms)
+            except Exception:
+                htf_state = None
             advice = analyze_setup(data["bars"], symbol, data["interval"], data["filters"],
-                                   now=now, cost_rate=cost_rate)
+                                   now=now, cost_rate=cost_rate, htf=htf_state)
             price = data["bars"][-1]["close"] if data["bars"] else None
             results.append({"symbol": symbol, "price": price, "market": data["market"],
                             "advice": advice, "error": None})
@@ -45,6 +52,7 @@ def main():
                        "market": row["market"],
                        "rating": row["advice"]["rating"] if row["advice"] else "error",
                        "score": row["advice"]["score"] if row["advice"] else None,
+                       "mtf": row["advice"]["mtf"]["label"] if row["advice"] and row["advice"].get("mtf") else None,
                        "error": row["error"]} for row in data], indent=2))
     return 0 if any(row["advice"] for row in data) else 1
 

@@ -77,7 +77,8 @@ class BinanceClientTests(unittest.TestCase):
         config = load_config()
         self.assertEqual([item["symbol"] for item in config["symbols"]],
                          ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT", "GRASSUSDT"])
-        self.assertEqual(config["intervals"], ["1m", "5m"])
+        self.assertEqual(config["intervals"], ["1m", "5m", "15m", "1h"])
+        self.assertEqual(config["default_interval"], "1h")
 
     def test_spot_unknown_symbol_falls_back_to_futures(self):
         now = 1_000_000
@@ -248,6 +249,52 @@ class PaperTradingTests(unittest.TestCase):
             self.assertEqual(Decimal(by_id["t-target"]["exit_price"]), Decimal("220"))
             # 2 * (220 - 200) - 2 * (200 + 220) * 0.0015 = 40 - 1.26 = 38.74
             self.assertEqual(Decimal(by_id["t-target"]["realized_pnl_usd"]), Decimal("38.74"))
+
+    def test_trailing_stop_moves_to_breakeven_and_trails_profit(self):
+        from paper_trading import compute_trailing_stop
+        config = load_config()
+        # Verify fee-buffered breakeven floor directly when stop_atr == trigger_atr (2.0)
+        be_stop, be_moved = compute_trailing_stop(
+            "100", "94", "106", atr_value="3", stop_atr="2.0",
+            trigger_atr="2.0", breakeven_buffer="0.004")
+        self.assertTrue(be_moved)
+        self.assertEqual(be_stop, Decimal("100.400"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "paper.json")
+            # Entry 100, initial stop 91 (1.8 * ATR where ATR = 5), target 122.5 (4.5 * ATR), partial 112.5 (2.5 * ATR)
+            record_entry("BTCUSDT", "long", "1", "100", "91", "122.5",
+                         config=config, path=path, trade_id="t-trail", atr="5",
+                         partial_target="112.5", partial_ratio="0.5")
+            # Step 1: Price reaches +1.0 * ATR (105) -> does NOT trigger yet (needs +2.5 * ATR = 112.5)
+            closed = auto_close_trades(
+                {"BTCUSDT": {"price": "104.5", "high": "105", "low": "99"}},
+                config=config, path=path)
+            self.assertEqual(closed, [])
+            trade = list_trades(config=config, path=path)[0]
+            self.assertEqual(Decimal(trade["stop"]), Decimal("91"))
+            self.assertFalse(trade["trailing_active"])
+            self.assertFalse(trade["partial_closed"])
+
+            # Step 2: Price climbs to 113 (+2.6 * ATR) -> Partial TP (50% @ 112.5) + Stop trails at max(100.4, 113 - 1.8*5) = 104
+            closed = auto_close_trades(
+                {"BTCUSDT": {"price": "112", "high": "113", "low": "105"}},
+                config=config, path=path)
+            self.assertEqual(closed, [])
+            trade = list_trades(config=config, path=path)[0]
+            self.assertEqual(Decimal(trade["stop"]), Decimal("104"))
+            self.assertTrue(trade["trailing_active"])
+            self.assertTrue(trade["partial_closed"])
+            self.assertEqual(Decimal(trade["quantity"]), Decimal("0.5"))
+            self.assertEqual(Decimal(trade["partial_pnl_usd"]), Decimal("6.25"))
+
+            # Step 3: Candle wicks down to 103.5 -> closes remaining 0.5 qty at trailed stop 104 (+2.0) + partial (+6.25) = +8.25
+            closed = auto_close_trades(
+                {"BTCUSDT": {"price": "105", "high": "106", "low": "103.5"}},
+                fee_rate="0", slippage_rate="0", config=config, path=path)
+            self.assertEqual(len(closed), 1)
+            self.assertEqual(Decimal(closed[0]["exit_price"]), Decimal("104"))
+            self.assertEqual(Decimal(closed[0]["realized_pnl_usd"]), Decimal("8.25"))
 
 
 if __name__ == "__main__":

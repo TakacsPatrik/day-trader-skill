@@ -40,7 +40,11 @@ def _interval_ms(interval):
         return 60_000
     if interval == "5m":
         return 300_000
-    raise TradingError("Interval must be 1m or 5m")
+    if interval == "15m":
+        return 900_000
+    if interval == "1h":
+        return 3_600_000
+    raise TradingError("Interval must be 1m, 5m, 15m or 1h")
 
 
 def build_plan(entry, stop, target_r, filters, side="long", target=None):
@@ -66,9 +70,13 @@ def build_plan(entry, stop, target_r, filters, side="long", target=None):
 
 
 def size_position(entry, stop, risk_usd, filters, max_position_usd=None,
-                  fee_rate=Decimal("0"), slippage_rate=Decimal("0")):
+                  fee_rate=Decimal("0"), slippage_rate=Decimal("0"),
+                  size_multiplier=Decimal("1")):
     entry, stop = dec(entry, "entry"), dec(stop, "stop")
-    risk_usd = dec(risk_usd, "USD risk")
+    mult = dec(size_multiplier, "size multiplier")
+    if mult <= 0:
+        raise TradingError("Size multiplier must be above zero")
+    risk_usd = dec(risk_usd, "USD risk") * mult
     step = dec(filters.get("step_size", "0.00000001"), "step size")
     min_qty = dec(filters.get("min_qty", "0"), "minimum quantity")
     tick = dec(filters.get("tick_size", "0.00000001"), "tick size")
@@ -80,7 +88,7 @@ def size_position(entry, stop, risk_usd, filters, max_position_usd=None,
     unit_loss = entry - stop + (entry + stop) * (dec(fee_rate) + dec(slippage_rate))
     qty = floor_step(risk_usd / unit_loss, step)
     if max_position_usd is not None:
-        cap_qty = floor_step(dec(max_position_usd) / entry, step)
+        cap_qty = floor_step(dec(max_position_usd) * mult / entry, step)
         qty = min(qty, cap_qty)
     notional = qty * entry
     estimated_loss = qty * unit_loss
@@ -89,7 +97,8 @@ def size_position(entry, stop, risk_usd, filters, max_position_usd=None,
     if notional < min_notional:
         raise TradingError("Calculated notional is below Binance minimum notional")
     return {"quantity": qty, "notional_usd": notional, "estimated_loss_usd": estimated_loss,
-            "risk_per_unit_usd": unit_loss, "step_size": step, "tick_size": tick}
+            "risk_per_unit_usd": unit_loss, "step_size": step, "tick_size": tick,
+            "size_multiplier": mult}
 
 
 def validate_risk(plan, quantity, settings, current_daily_loss=0, trades_today=0):
@@ -131,6 +140,17 @@ def rating_for(score):
     if score >= 40:
         return "NEUTRAL"
     return "AVOID"
+
+
+def breakeven_win_rate(stop_atr=1.8, target_atr=4.5):
+    """Breakeven win rate from Risk / (Risk + Reward)."""
+    s, t = float(stop_atr), float(target_atr)
+    return s / (s + t) if (s + t) > 0 else 0.5
+
+
+def required_ev_threshold(stop_atr=1.8, target_atr=4.5, multiplier=1.25):
+    """Dynamic +EV win-probability threshold (default: 1.25x breakeven win rate)."""
+    return min(0.95, breakeven_win_rate(stop_atr, target_atr) * float(multiplier))
 
 
 def _trade_levels(entry, atr_value, supports, resistances, sweep_low=None):
@@ -175,8 +195,12 @@ def _near_zone(value, zones, tolerance):
     return next((z for z in zones if z["low"] - tolerance <= value <= z["high"] + tolerance), None)
 
 
-def analyze_setup(bars, symbol="", interval="5m", filters=None, now=None, cost_rate=0):
+def analyze_setup(bars, symbol="", interval="5m", filters=None, now=None, cost_rate=0, htf=None):
     """Score a long setup (0-100) and derive entry, stop, and targets.
+
+    ``htf`` is the optional ``mtf.evaluate()`` macro trend state (1h/4h). When
+    given, a long can only rate BUY/WATCH or better if every higher timeframe
+    closes above its EMA50 (trend alignment); otherwise the score is capped at 59.
 
     Indicators and patterns use closed candles only (stable, no flicker);
     the live price of the forming candle is used for entry and distances.
@@ -355,6 +379,13 @@ def analyze_setup(bars, symbol="", interval="5m", filters=None, now=None, cost_r
     else:
         part("SMC", "Likviditás-lesöprés", 0, 8, "warn", "Nincs friss bikás likviditás-lesöprés")
 
+    if htf is not None:
+        bulls, total = htf.get("bull_count", 0), htf.get("total", 0)
+        mtf_points = int(round(10.0 * bulls / total)) if total else 0
+        mtf_status = "ok" if htf.get("aligned") else ("warn" if bulls else "bad")
+        part("MTF", "Makro trend (1h/4h)", mtf_points, 10, mtf_status,
+             "Makro trend %s: %s" % (htf.get("label", ""), htf.get("detail", "")))
+
     extras = []
     if squeeze["active"]:
         extras.append({"status": "warn", "text": "Bollinger Squeeze: szűkülés, nagy kitörés közeleg "
@@ -398,20 +429,37 @@ def analyze_setup(bars, symbol="", interval="5m", filters=None, now=None, cost_r
         "Átlag feletti volume": rvol_value is not None and rvol_value >= 1.0,
         "Bikás minta": bool(recent_bullish or bullish_charts or bull_sweep),
     }
+    position_scale = 1.0
+    if htf is not None:
+        position_scale = float(htf.get("size_multiplier", 1.0 if htf.get("aligned") else 0.0))
+        if interval == "1h" and not htf.get("aligned"):
+            position_scale = 0.0
+        conditions["Makro trend 1h/4h ↑"] = bool(htf.get("aligned"))
     gate_notes = []
     cost_pct_f = float(cost_rate) * 200 if cost_rate else 0.0
-    net_t1_f = (levels["t1"] / price - 1) * 100 - cost_pct_f
+    t1_gross_pct_f = (levels["t1"] / price - 1) * 100
+    net_t1_f = t1_gross_pct_f - cost_pct_f
     if avoid:
         score = min(score, 39)
-    elif cost_pct_f and net_t1_f <= 0:
-        score = min(score, 59)
-        gate_notes.append("A T1 hozam (%+.2f%%) nem fedezi a díjakat és csúszást (−%.2f%%): "
-                          "ilyen kis céllal nem éri meg belépni" %
-                          ((levels["t1"] / price - 1) * 100, cost_pct_f))
-    elif score >= 75 and not all(conditions.values()):
-        score = 74
-        gate_notes.append("Az ERŐS VÉTEL feltételei nem teljesülnek: %s" %
-                          ", ".join(k for k, v in conditions.items() if not v))
+    else:
+        if htf is not None and position_scale <= 0.0:
+            score = min(score, 59)
+            gate_notes.append("A makro trend (4h/1h EMA50) medvés – long belépés tiltva: %s"
+                              % htf.get("detail", ""))
+        elif htf is not None and position_scale < 1.0:
+            score = min(score, 74)
+            gate_notes.append("Vegyes makro trend (1h bikás, 4h medvés): a belépés engedélyezett, "
+                              "de csökkentett (50%%-os) kockázattal és pozíciómérettel (%s)"
+                              % htf.get("detail", ""))
+        if cost_pct_f and (net_t1_f <= 0 or t1_gross_pct_f < 2.5 * cost_pct_f):
+            score = min(score, 59)
+            gate_notes.append("A T1 hozam (%+.2f%%) túl kicsi a díjakhoz és csúszáshoz (−%.2f%%) képest: "
+                              "alacsony volatilitás miatt a költség-kapu blokkolja a belépést" %
+                              (t1_gross_pct_f, cost_pct_f))
+        elif score >= 75 and not all(conditions.values()):
+            score = 74
+            gate_notes.append("Az ERŐS VÉTEL feltételei nem teljesülnek: %s" %
+                              ", ".join(k for k, v in conditions.items() if not v))
     rating = rating_for(score)
 
     entry_mode = "market"
@@ -436,8 +484,10 @@ def analyze_setup(bars, symbol="", interval="5m", filters=None, now=None, cost_r
         t2_pct = float((t2_d / entry_d - 1) * 100)
         risk_d = entry_d - stop_d
         rr1, rr2 = float((t1_d - entry_d) / risk_d), float((t2_d - entry_d) / risk_d)
+        be_wr = 1.0 / (1.0 + rr1)
+        req_ev = min(0.95, 1.25 * be_wr)
     else:
-        stop_pct = t1_pct = t2_pct = rr1 = rr2 = None
+        stop_pct = t1_pct = t2_pct = rr1 = rr2 = be_wr = req_ev = None
         entry_d = stop_d = t1_d = t2_d = None
 
     reasons = [{"status": p["status"], "text": p["text"]} for p in parts] + extras
@@ -476,13 +526,15 @@ def analyze_setup(bars, symbol="", interval="5m", filters=None, now=None, cost_r
         actionable=rating in ("STRONG_BUY", "BUY_WATCH") and valid, entry_mode=entry_mode,
         price=dec(format(price, ".12g")), entry=entry_d, stop=stop_d, t1=t1_d, t2=t2_d,
         stop_pct=stop_pct, t1_pct=t1_pct, t2_pct=t2_pct, t1_net_pct=(t1_pct - cost_pct) if valid else None,
-        rr1=rr1, rr2=rr2, stop_basis=levels["stop_basis"], t1_basis=levels["t1_basis"],
+        rr1=rr1, rr2=rr2, breakeven_win_rate=be_wr, required_threshold=req_ev,
+        stop_basis=levels["stop_basis"], t1_basis=levels["t1_basis"],
         patterns=pattern_list, pattern_summary=", ".join(named[:3]) or "—",
         reasons=reasons, breakdown=parts, conditions=conditions, avoid=avoid, structure=structure,
         supports=supports, resistances=resistances, advice=advice, vwap_mode=vwap_mode,
         squeeze=squeeze, forming=forming is not None,
         smc={"bullish_sweep": bull_sweep, "bearish_sweep": bear_sweep,
-             "sweeps": sweeps, "geometry": charts_geo},
+             "sweeps": sweeps, "geometry": charts_geo}, mtf=htf,
+        position_scale=position_scale,
         indicators={"ema20": ema20, "ema50": ema50, "ema200": ema200, "vwap": vwap,
                     "rsi": rsi_value, "macd": macd_line, "macd_signal": macd_signal,
                     "macd_hist": hist, "atr": atr_value, "atr_pct": atr_value / price * 100,

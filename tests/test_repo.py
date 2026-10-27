@@ -7,8 +7,8 @@ from _load import ROOT
 
 class Repository(unittest.TestCase):
     def test_local_crypto_app_files_exist(self):
-        for path in ("app.py", "binance_client.py", "crypto_engine.py",
-                     "paper_trading.py", "config.json", "requirements.txt"):
+        for path in ("app.py", "binance_client.py", "crypto_engine.py", "mtf.py",
+                     "ml_model.py", "bot.py", "paper_trading.py", "config.json", "requirements.txt"):
             self.assertTrue(os.path.isfile(os.path.join(ROOT, path)), path)
 
     def test_configuration_has_the_six_default_symbols(self):
@@ -16,7 +16,11 @@ class Repository(unittest.TestCase):
             config = json.load(handle)
         self.assertEqual([coin["symbol"] for coin in config["symbols"]],
                          ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT", "GRASSUSDT"])
-        self.assertEqual(config["intervals"], ["1m", "5m"])
+        self.assertEqual(config["intervals"], ["1m", "5m", "15m", "1h"])
+        self.assertEqual(config["default_interval"], "1h")
+        self.assertEqual(config["ml"]["target_atr"], 4.5)
+        self.assertEqual(config["ml"]["stop_atr"], 1.8)
+        self.assertEqual(config["ml"]["horizon_bars"], 48)
 
     def test_legacy_live_broker_and_stock_research_modules_are_removed(self):
         for path in ("trader-broker", "trader-analyst", "trader-pelosi", ".claude-plugin"):

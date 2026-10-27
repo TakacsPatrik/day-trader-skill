@@ -63,19 +63,41 @@ and use the live price for entries:
   support or sweep wick, or at entry - 1.5 ATR. T1 sits before the first
   swing-high resistance, never below 1.5R; T2 is entry + 3 ATR or 2.5R.
 
-## Machine Learning Win-Probability Classifier
+## Machine Learning Win-Probability Classifier & Multi-Timeframe (MTF) Filter
+
+`mtf.py` fetches higher-timeframe (`1h` and `4h`) candles and evaluates look-ahead-free
+macro trend alignment (`close > EMA50` on the last closed 1h and 4h candles).
+Both the Setup Advisor (`crypto_engine.py`) and the ML classifier (`ml_model.py`)
+enforce **Trend Alignment**: if the 1h/4h macro trend is not aligned, the Setup
+Score is capped at 59 (`NEUTRAL`) and the ML win probability is capped at the
+historical base rate.
 
 `ml_model.py` provides a local, lightweight machine learning model powered by
 `scikit-learn` (`RandomForestClassifier`):
 
-- **Features (24):** distances to EMAs/VWAP in ATR units, ATR%, volatility regime,
+- **Features (27):** distances to EMAs/VWAP in ATR units, ATR%, volatility regime,
   RVOL, RSI, MACD histogram, Bollinger position, distance to confirmed swing
   support/resistance, market structure, geometric patterns (Double Bottom, Triangles),
-  SMC liquidity sweeps, candlestick reversals, and time-of-day cyclics.
+  SMC liquidity sweeps, candlestick reversals, time-of-day cyclics, and 1h/4h
+  EMA50 macro trend alignment (`htf1_dist`, `htf4_dist`, `mtf_aligned`).
 - **Label:** 1 if price reaches the 1.5×ATR target before the 1.5×ATR stop within
   48 bars, else 0.
 - **Validation:** Chronological purged holdout test reporting ROC AUC, Brier
   score, calibration curves, and feature importance with directional local effects.
+
+## Standalone Walk-Forward Backtester & Auto-Paper Robot (`bot.py`)
+
+`bot.py` runs autonomously from the command line (or via the dashboard's ML tab):
+
+```powershell
+# Walk-forward historical backtest (e.g. 90 days) with Total Profit, Win Rate & Max Drawdown report
+python bot.py backtest BTCUSDT --days 90
+python bot.py backtest ETHUSDT --days 60 --threshold 0.65 --csv
+
+# Background Auto-Paper trading daemon (opens paper trades when ML > 75% and 1h+4h MTF is bullish)
+python bot.py paper
+python bot.py paper --once
+```
 
 ## Dashboard
 

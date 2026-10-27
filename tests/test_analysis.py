@@ -3,6 +3,7 @@ import math
 import os
 import random
 import sys
+import tempfile
 import unittest
 from decimal import Decimal
 
@@ -10,9 +11,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import bot
 import ml_model
+import mtf
 import technical_analysis as ta
+from binance_client import load_config
 from crypto_engine import TradingError, analyze_setup, build_plan, rating_for
+from paper_trading import list_trades
 
 STEP = 300_000
 START = int(datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc).timestamp() * 1000)
@@ -282,6 +287,8 @@ class MLModelTests(unittest.TestCase):
         self.assertEqual(len(bundle["importance"]), len(ml_model.FEATURE_KEYS))
         pred = ml_model.predict_setup(bundle, bars, now=now)
         self.assertTrue(0.0 <= pred["probability"] <= 1.0)
+        self.assertAlmostEqual(pred["breakeven"], 1.8 / (1.8 + 4.5), places=6)
+        self.assertAlmostEqual(pred["required_threshold"], 1.25 * (1.8 / (1.8 + 4.5)), places=6)
         self.assertEqual(len(pred["top_factors"]), 3)
         self.assertTrue(pred["stop"] < pred["entry"] < pred["target"])
 
@@ -289,6 +296,167 @@ class MLModelTests(unittest.TestCase):
         bars = make_bars(random_walk(120, 0.002))
         with self.assertRaises(ml_model.ModelError):
             ml_model.train_model(bars, "5m", now=after(bars))
+
+    def test_mtf_filter_caps_advisor_and_ml_probability_when_misaligned(self):
+        closes = [100 + 0.03 * i + 2.5 * math.sin(i / 8.0) + 1.1 * math.cos(i / 3.0)
+                  for i in range(1100)]
+        bars = make_bars(closes, spread=0.25)
+        now = after(bars)
+        end_ms = int(now.timestamp() * 1000)
+        # Build rising 1h/4h bars and falling 1h/4h bars
+        h1_step, h4_step = 3_600_000, 14_400_000
+        h1_start = START - 70 * h1_step
+        h4_start = START - 70 * h4_step
+        bull_htf = {
+            "1h": make_bars([100 + 0.5 * i for i in range(200)], start=h1_start, step=h1_step),
+            "4h": make_bars([100 + 1.5 * i for i in range(120)], start=h4_start, step=h4_step),
+        }
+        mixed_htf = {
+            "1h": make_bars([100 + 0.5 * i for i in range(200)], start=h1_start, step=h1_step),
+            "4h": make_bars([300 - 1.5 * i for i in range(120)], start=h4_start, step=h4_step),
+        }
+        bear_htf = {
+            "1h": make_bars([300 - 0.5 * i for i in range(200)], start=h1_start, step=h1_step),
+            "4h": make_bars([300 - 1.5 * i for i in range(120)], start=h4_start, step=h4_step),
+        }
+        bull_state = mtf.evaluate(mtf.build_series(bull_htf), end_ms)
+        mixed_state = mtf.evaluate(mtf.build_series(mixed_htf), end_ms)
+        bear_state = mtf.evaluate(mtf.build_series(bear_htf), end_ms)
+        self.assertTrue(bull_state["aligned"])
+        self.assertEqual(bull_state["size_multiplier"], 1.0)
+        self.assertFalse(mixed_state["aligned"])
+        self.assertTrue(mixed_state["allow_long"])
+        self.assertEqual(mixed_state["size_multiplier"], 0.5)
+        self.assertFalse(bear_state["aligned"])
+        self.assertFalse(bear_state["allow_long"])
+        self.assertEqual(bear_state["size_multiplier"], 0.0)
+
+        # Advisor caps score at <= 59 when 1h is bearish, but allows half-size when 1h is bullish & 4h bearish
+        adv_bear = analyze_setup(bars[-450:], "BTCUSDT", "5m", FILTERS, now=now, htf=bear_state)
+        self.assertLessEqual(adv_bear["score"], 59)
+        self.assertFalse(adv_bear["actionable"])
+        self.assertEqual(adv_bear["position_scale"], 0.0)
+
+        adv_mixed = analyze_setup(bars[-450:], "BTCUSDT", "5m", FILTERS, now=now, htf=mixed_state)
+        self.assertEqual(adv_mixed["position_scale"], 0.5)
+
+        # ML model caps probability at base_rate when 1h is bearish, but allows 0.5x when 1h is bullish
+        cfg = {"ml": {"min_train_samples": 250, "n_estimators": 40, "horizon_bars": 24, "auto_threshold": 0.55}}
+        bundle = ml_model.train_model(bars, "5m", now=now, config=cfg, htf_bars=bull_htf)
+        pred_bear = ml_model.predict_setup(bundle, bars, now=now, htf_bars=bear_htf)
+        self.assertFalse(pred_bear["mtf_aligned"])
+        self.assertEqual(pred_bear["size_multiplier"], 0.0)
+        self.assertLessEqual(pred_bear["probability"], pred_bear["base_rate"] + 1e-9)
+        self.assertFalse(pred_bear["signal"])
+
+        pred_mixed = ml_model.predict_setup(bundle, bars, now=now, htf_bars=mixed_htf)
+        self.assertEqual(pred_mixed["size_multiplier"], 0.5)
+        self.assertTrue(pred_mixed["mtf_allow_long"])
+
+        # On 1h trading interval, bearish 4h blocks trades completely (size_multiplier == 0.0)
+        mixed_state_1h = mtf.evaluate(mtf.build_series(mixed_htf), end_ms, trading_interval="1h")
+        self.assertFalse(mixed_state_1h["allow_long"])
+        self.assertEqual(mixed_state_1h["size_multiplier"], 0.0)
+        adv_mixed_1h = analyze_setup(bars[-450:], "BTCUSDT", "1h", FILTERS, now=now, htf=mixed_state_1h)
+        self.assertEqual(adv_mixed_1h["position_scale"], 0.0)
+        self.assertFalse(adv_mixed_1h["actionable"])
+
+
+class BotAndBacktestTests(unittest.TestCase):
+    def test_walk_forward_backtest_runs_and_produces_report(self):
+        # 2400 x 15m candles = 25 days; train on first 8 days, walk-forward test on rest
+        closes = [100 + 0.015 * i + 2.8 * math.sin(i / 7.0) + 1.3 * math.cos(i / 3.0)
+                  for i in range(2400)]
+        bars = make_bars(closes, spread=0.35, step=900_000)
+        now = after(bars)
+        h1_step, h4_step = 3_600_000, 14_400_000
+        htf_bars = {
+            "1h": make_bars([100 + 0.4 * i for i in range(720)], start=START - 80 * h1_step, step=h1_step),
+            "4h": make_bars([100 + 1.2 * i for i in range(240)], start=START - 80 * h4_step, step=h4_step),
+        }
+        config = load_config()
+        config = dict(config, ml=dict(config["ml"], min_train_samples=250, n_estimators=30, horizon_bars=24))
+        report = bot.run_backtest(
+            "BTCUSDT", interval="15m", train_days=8.0, retrain_days=5.0,
+            threshold=0.15, require_mtf=True, config=config, now=now,
+            bars=bars, htf_bars=htf_bars, filters=FILTERS)
+        self.assertGreater(report["strategy"]["models_trained"], 0)
+        self.assertGreater(report["trades"], 0)
+        self.assertIn("total_profit_usd", report)
+        self.assertIn("win_rate", report)
+        self.assertIn("breakeven_win_rate", report)
+        self.assertAlmostEqual(report["breakeven_win_rate"], 1.8 / (1.8 + 4.5), places=6)
+        self.assertAlmostEqual(
+            report["strategy"]["required_ev_threshold"], 1.25 * (1.8 / (1.8 + 4.5)), places=6)
+        self.assertIn("max_drawdown_usd", report)
+        formatted = bot.format_report(report)
+        self.assertIn("Total Profit", formatted)
+        self.assertIn("Win Rate", formatted)
+        self.assertIn("Break-even Win Rate", formatted)
+        self.assertIn("Dinamikus Küszöb (Required +EV Threshold)", formatted)
+        self.assertIn("Max Drawdown", formatted)
+
+    def test_paper_bot_opens_trade_when_probability_and_mtf_pass(self):
+        closes = [100 + 0.02 * i + 2.6 * math.sin(i / 7.0) + 1.2 * math.cos(i / 3.0)
+                  for i in range(1100)]
+        bars = make_bars(closes, spread=0.3)
+        now = after(bars)
+        h1_step, h4_step = 3_600_000, 14_400_000
+        bull_htf = {
+            "1h": make_bars([100 + 0.5 * i for i in range(240)], start=START - 80 * h1_step, step=h1_step),
+            "4h": make_bars([100 + 1.5 * i for i in range(120)], start=START - 80 * h4_step, step=h4_step),
+        }
+
+        class FakeClient:
+            def get_klines(self, symbol, interval, limit=500, start_time=None, end_time=None, include_open=False):
+                if interval in ("1h", "4h"):
+                    return {"symbol": symbol, "interval": interval, "market": "spot",
+                            "bars": bull_htf[interval], "filters": FILTERS}
+                return {"symbol": symbol, "interval": interval, "market": "spot",
+                        "bars": bars, "filters": FILTERS}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paper_path = os.path.join(tmp, "paper_trades.json")
+            config = load_config()
+            config = dict(
+                config,
+                symbols=[{"symbol": "BTCUSDT", "base": "BTC"}],
+                ml=dict(config["ml"], min_train_samples=250, n_estimators=30, horizon_bars=18, auto_threshold=0.05),
+                storage=dict(config["storage"], paper_trades=paper_path),
+            )
+            pbot = bot.PaperBot(config=config, client=FakeClient(), interval="5m",
+                                threshold=0.05, symbols=["BTCUSDT"])
+            opened = pbot.cycle(now=now)
+            self.assertEqual(len(opened), 1)
+            self.assertEqual(opened[0]["symbol"], "BTCUSDT")
+            self.assertEqual(opened[0]["status"], "open")
+            # Second cycle on the same closed candle does not open a duplicate position
+            self.assertEqual(pbot.cycle(now=now), [])
+            saved = list_trades(config=config, path=paper_path)
+            self.assertEqual(len(saved), 1)
+
+            # Verify half-size position when 1h is bullish and 4h is bearish
+            mixed_htf = {
+                "1h": bull_htf["1h"],
+                "4h": make_bars([300 - 1.5 * i for i in range(120)], start=START - 80 * h4_step, step=h4_step),
+            }
+
+            class MixedClient:
+                def get_klines(self, symbol, interval, limit=500, start_time=None, end_time=None, include_open=False):
+                    if interval in ("1h", "4h"):
+                        return {"symbol": symbol, "interval": interval, "market": "spot",
+                                "bars": mixed_htf[interval], "filters": FILTERS}
+                    return {"symbol": symbol, "interval": interval, "market": "spot",
+                            "bars": bars, "filters": FILTERS}
+
+            paper_path_half = os.path.join(tmp, "paper_half.json")
+            cfg_half = dict(config, storage=dict(config["storage"], paper_trades=paper_path_half))
+            pbot_half = bot.PaperBot(config=cfg_half, client=MixedClient(), interval="5m",
+                                     threshold=0.05, symbols=["BTCUSDT"])
+            opened_half = pbot_half.cycle(now=now)
+            self.assertEqual(len(opened_half), 1)
+            self.assertAlmostEqual(
+                float(opened_half[0]["quantity"]), float(opened[0]["quantity"]) * 0.5, places=3)
 
 
 if __name__ == "__main__":

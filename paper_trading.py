@@ -91,7 +91,8 @@ def daily_risk(trades, now=None, fee_rate=Decimal("0"), slippage_rate=Decimal("0
 
 
 def record_entry(symbol, side, quantity, entry_price, stop=None, target=None,
-                 note="", config=None, path=None, trade_id=None, now=None):
+                 note="", config=None, path=None, trade_id=None, now=None, atr=None,
+                 partial_target=None, partial_ratio="0.5"):
     config = config or load_config()
     symbol = str(symbol).upper()
     allowed = {row["symbol"] for row in config["symbols"]}
@@ -104,6 +105,9 @@ def record_entry(symbol, side, quantity, entry_price, stop=None, target=None,
         raise TradingError("Quantity and entry price must be above zero")
     stop_value = dec(stop, "stop") if stop not in (None, "") else None
     target_value = dec(target, "target") if target not in (None, "") else None
+    partial_value = dec(partial_target, "partial_target") if partial_target not in (None, "") else None
+    partial_rat = dec(partial_ratio, "partial_ratio") if partial_ratio not in (None, "") else Decimal("0.5")
+    atr_value = dec(atr, "atr") if atr not in (None, "") else None
     if stop_value is None:
         raise TradingError("A paper entry requires a stop price")
     if stop_value is not None and stop_value >= entry:
@@ -112,9 +116,16 @@ def record_entry(symbol, side, quantity, entry_price, stop=None, target=None,
         raise TradingError("Target must be above entry for a long paper trade")
     target_path = _journal_path(config, path)
     trade = {"id": trade_id or uuid.uuid4().hex, "symbol": symbol, "side": "long",
-             "quantity": format(qty, "f"), "entry_price": format(entry, "f"),
+             "quantity": format(qty, "f"), "initial_quantity": format(qty, "f"),
+             "entry_price": format(entry, "f"),
              "stop": format(stop_value, "f") if stop_value is not None else None,
+             "initial_stop": format(stop_value, "f") if stop_value is not None else None,
              "target": format(target_value, "f") if target_value is not None else None,
+             "partial_target": format(partial_value, "f") if partial_value is not None else None,
+             "partial_ratio": format(partial_rat, "f") if partial_value is not None else None,
+             "partial_closed": False, "partial_pnl_usd": "0",
+             "atr": format(atr_value, "f") if atr_value is not None else None,
+             "highest_price": format(entry, "f"), "trailing_active": False,
              "entry_at": _stamp(now), "exit_at": None, "exit_price": None,
              "status": "open", "realized_pnl_usd": None, "note": str(note)}
     with _LOCK:
@@ -154,14 +165,55 @@ def close_trade(trade_id, exit_price, fee_rate=Decimal("0"), slippage_rate=Decim
     return trade
 
 
+def compute_trailing_stop(entry, current_stop, highest_price, atr_value=None,
+                          initial_stop=None, stop_atr=Decimal("1.8"),
+                          trigger_atr=Decimal("2.5"),
+                          breakeven_buffer=Decimal("0.004")):
+    """Calculate ratcheted Trailing Stop-Loss for a long position with fee-buffered Breakeven.
+
+    Once ``highest_price >= entry + trigger_atr * ATR`` (default +2.5x ATR),
+    the stop is pulled up at least to ``entry * (1 + breakeven_buffer)`` (true
+    fee-adjusted Breakeven), and then trails ``highest_price`` at
+    ``stop_atr * ATR`` distance. Stop never moves downward.
+    """
+    entry_d = dec(entry, "entry")
+    stop_d = dec(current_stop, "stop")
+    high_d = max(entry_d, dec(highest_price, "highest price"))
+    stop_mult = dec(stop_atr, "stop_atr")
+    trig_mult = dec(trigger_atr, "trigger_atr")
+    buf_d = dec(breakeven_buffer, "breakeven_buffer")
+    if atr_value not in (None, "") and dec(atr_value, "atr") > 0:
+        atr_d = dec(atr_value, "atr")
+        trail_dist = stop_mult * atr_d
+    else:
+        init_d = dec(initial_stop, "initial_stop") if initial_stop not in (None, "") else stop_d
+        trail_dist = max(Decimal("0"), entry_d - init_d)
+        atr_d = (trail_dist / stop_mult) if stop_mult > 0 else trail_dist
+    if atr_d <= 0:
+        return stop_d, stop_d >= entry_d
+    if high_d - entry_d >= trig_mult * atr_d:
+        be_floor = entry_d * (Decimal("1") + buf_d)
+        candidate = max(be_floor, high_d - trail_dist)
+        new_stop = max(stop_d, candidate)
+        return new_stop, new_stop >= entry_d
+    return stop_d, stop_d >= entry_d
+
+
 def auto_close_trades(quotes, fee_rate=Decimal("0"), slippage_rate=Decimal("0"),
                       config=None, path=None, now=None):
-    """Automatically close open paper trades when price hits Stop-Loss or Target.
+    """Automatically close open paper trades on Stop/Target and update Trailing Stops.
 
-    ``quotes`` maps symbol -> current price (or dict with ``price``, ``high``, ``low``).
-    If both stop and target are touched in the same update, stop wins (conservative).
+    ``quotes`` maps symbol -> current price (or dict with ``price``, ``high``, ``low``,
+    and optional ``atr``). If both stop and target are touched in the same update,
+    stop wins (conservative). For trades that remain open, when price moves at least
+    ``+2.0 * ATR`` in profit, the stop is moved to fee-adjusted Breakeven
+    (``entry * (1 + breakeven_buffer_pct)``) and trails the highest price reached.
     """
     config = config or load_config()
+    ml_cfg = config.get("ml", {}) or {}
+    stop_atr = dec(ml_cfg.get("stop_atr", "1.8"))
+    trigger_atr = dec(ml_cfg.get("trail_trigger_atr", "2.5"))
+    be_buffer = dec(ml_cfg.get("breakeven_buffer_pct", "0.004"))
     fees = dec(fee_rate, "fee rate")
     slippage = dec(slippage_rate, "slippage rate")
     target_path = _journal_path(config, path)
@@ -176,32 +228,67 @@ def auto_close_trades(quotes, fee_rate=Decimal("0"), slippage_rate=Decimal("0"),
             quote = (quotes or {}).get(symbol)
             if quote is None:
                 continue
+            quote_atr = None
             if isinstance(quote, dict):
                 price = dec(quote["price"], "price")
                 high = dec(quote.get("high", price), "high")
                 low = dec(quote.get("low", price), "low")
+                if quote.get("atr") not in (None, ""):
+                    quote_atr = dec(quote["atr"], "atr")
             else:
                 price = high = low = dec(quote, "price")
+            entry = dec(trade["entry_price"], "entry price")
             stop = dec(trade["stop"], "stop") if trade.get("stop") not in (None, "") else None
             target = dec(trade["target"], "target") if trade.get("target") not in (None, "") else None
+            partial_target = dec(trade["partial_target"], "partial_target") \
+                if trade.get("partial_target") not in (None, "") else None
             hit_reason = None
             exit_value = None
             if stop is not None and (price <= stop or low <= stop):
-                hit_reason = "stop"
+                hit_reason = "trailing_stop" if trade.get("trailing_active") else "stop"
                 exit_value = min(price, stop)
             elif target is not None and (price >= target or high >= target):
                 hit_reason = "target"
                 exit_value = target
             if hit_reason is not None and exit_value is not None and exit_value > 0:
                 qty = dec(trade["quantity"])
-                entry = dec(trade["entry_price"])
                 notional = qty * (entry + exit_value)
                 pnl = qty * (exit_value - entry) - notional * (fees + slippage)
+                pnl += dec(trade.get("partial_pnl_usd") or "0")
                 trade.update(status="closed", exit_price=format(exit_value, "f"),
                              exit_at=_stamp(now), exit_reason=hit_reason,
                              realized_pnl_usd=format(pnl, "f"))
                 closed_now.append(dict(trade))
                 changed = True
+            elif stop is not None:
+                if (partial_target is not None and not trade.get("partial_closed")
+                        and (price >= partial_target or high >= partial_target)):
+                    qty = dec(trade["quantity"])
+                    p_ratio = dec(trade.get("partial_ratio") or "0.5")
+                    part_qty = qty * p_ratio
+                    rem_qty = qty - part_qty
+                    if part_qty > 0 and rem_qty > 0:
+                        part_notional = part_qty * (entry + partial_target)
+                        part_pnl = part_qty * (partial_target - entry) - part_notional * (fees + slippage)
+                        trade["quantity"] = format(rem_qty, "f")
+                        trade["partial_closed"] = True
+                        trade["partial_pnl_usd"] = format(part_pnl, "f")
+                        changed = True
+                prev_high = dec(trade.get("highest_price") or entry)
+                peak = max(prev_high, high, price)
+                atr_val = quote_atr or (dec(trade["atr"]) if trade.get("atr") not in (None, "") else None)
+                new_stop, trailed = compute_trailing_stop(
+                    entry, stop, peak, atr_value=atr_val,
+                    initial_stop=trade.get("initial_stop") or stop,
+                    stop_atr=stop_atr, trigger_atr=trigger_atr,
+                    breakeven_buffer=be_buffer)
+                if new_stop > stop or peak > prev_high:
+                    trade["stop"] = format(new_stop, "f")
+                    trade["highest_price"] = format(peak, "f")
+                    trade["trailing_active"] = bool(trailed)
+                    if atr_val is not None and not trade.get("atr"):
+                        trade["atr"] = format(atr_val, "f")
+                    changed = True
         if changed:
             _save(target_path, document)
     return closed_now

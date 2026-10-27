@@ -9,7 +9,10 @@ from decimal import Decimal, InvalidOperation
 import requests
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-INTERVAL_MS = {"1m": 60_000, "5m": 300_000}
+INTERVAL_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
+# Trading (analysis) intervals selectable in config.json; 1h/4h are fetched as
+# higher-timeframe context only.
+TRADING_INTERVALS = ("1m", "5m", "15m", "1h")
 UNKNOWN_SYMBOL_CODES = {-1121}
 FUTURES_MEMO_MS = 3_600_000
 
@@ -42,8 +45,8 @@ def load_config(path=None):
                           {"symbol": symbol, "base": symbol[:-4], "name": symbol[:-4],
                            "aliases": [symbol[:-4]]})
     intervals = config.get("intervals")
-    if not isinstance(intervals, list) or not intervals or any(i not in INTERVAL_MS for i in intervals):
-        raise BinanceError("config.json intervals may contain only 1m and 5m")
+    if not isinstance(intervals, list) or not intervals or any(i not in TRADING_INTERVALS for i in intervals):
+        raise BinanceError("config.json intervals may contain only 1m, 5m, 15m and 1h")
     if config.get("default_interval") not in intervals:
         raise BinanceError("default_interval must be one of the configured intervals")
     config["symbols"] = normalized
@@ -161,7 +164,7 @@ class BinanceClient:
                    end_time=None, include_open=False, market="spot"):
         symbol = str(symbol).upper()
         if interval not in INTERVAL_MS:
-            raise BinanceError("Unsupported interval %r; use 1m or 5m" % interval)
+            raise BinanceError("Unsupported interval %r; use 1m, 5m, 15m, 1h or 4h" % interval)
         configured = {row["symbol"] for row in self.config["symbols"]}
         if symbol not in configured:
             raise BinanceError("Symbol %s is not in config.json" % symbol)
